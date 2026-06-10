@@ -2,7 +2,7 @@ import express from "express";
 import multer from "multer";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, normalize } from "node:path";
 import { spawn } from "node:child_process";
 import { z } from "zod";
 
@@ -45,6 +45,7 @@ type PlyJob = {
 };
 
 const plyJobs = new Map<string, PlyJob>();
+const viewerJobs = new Map<string, { jobId: string; dir: string; sourceName: string; createdAt: number }>();
 
 const plyCleanOptionsSchema = z.object({
   preset: z.enum(["light", "medium", "strong"]).default("light"),
@@ -216,6 +217,74 @@ app.post("/api/ply/clean", trackPlyUploadProgress, plyUpload.single("file"), asy
   }
 });
 
+app.post("/api/ply/viewer/convert", plyUpload.single("file"), async (req, res, next) => {
+  let inputPath: string | null = null;
+  try {
+    if (!req.file || !("path" in req.file) || !req.file.path) {
+      res.status(400).json({ error: "file is required" });
+      return;
+    }
+    inputPath = req.file.path;
+    const jobId = typeof req.query.jobId === "string" && req.query.jobId ? req.query.jobId : randomJobId();
+    const dir = await mkdtemp(join(tmpdir(), "trajectory-gui-viewer-"));
+    const maxPoints = Math.max(1_000, Math.min(2_000_000, Number(req.body.maxPoints ?? 500_000) || 500_000));
+    const manifest = await runPythonJson("server/python/convert_3dgs_viewer.py", [
+      inputPath,
+      dir,
+      "--max-points",
+      String(maxPoints),
+      "--progress",
+    ]);
+    viewerJobs.set(jobId, { jobId, dir, sourceName: req.file.originalname || "input.ply", createdAt: Date.now() });
+    await rm(inputPath, { force: true });
+    inputPath = null;
+    res.json({ jobId, manifest });
+  } catch (error) {
+    if (inputPath) {
+      await rm(inputPath, { force: true });
+    }
+    next(error);
+  }
+});
+
+app.get("/api/ply/viewer/jobs/:jobId/events", (req, res) => {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+  res.write(`data: ${JSON.stringify({ jobId: req.params.jobId, phase: "ready", message: "Viewer conversion endpoint is ready." })}\n\n`);
+  res.end();
+});
+
+app.get("/api/ply/viewer/jobs/:jobId/manifest", async (req, res, next) => {
+  try {
+    const job = viewerJobs.get(req.params.jobId);
+    if (!job) {
+      res.status(404).json({ error: "viewer job not found" });
+      return;
+    }
+    res.sendFile(join(job.dir, "viewer-manifest.json"));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/ply/viewer/jobs/:jobId/chunks/:chunkName", async (req, res) => {
+  const job = viewerJobs.get(req.params.jobId);
+  if (!job) {
+    res.status(404).json({ error: "viewer job not found" });
+    return;
+  }
+  const safeChunk = safeFileName(req.params.chunkName);
+  const chunkPath = normalize(join(job.dir, "chunks", safeChunk));
+  if (!chunkPath.startsWith(normalize(join(job.dir, "chunks")))) {
+    res.status(400).json({ error: "invalid chunk path" });
+    return;
+  }
+  res.sendFile(chunkPath);
+});
+
 app.post("/api/trajectory/export", async (req, res, next) => {
   try {
     const dir = await mkdtemp(join(tmpdir(), "trajectory-gui-"));
@@ -299,6 +368,10 @@ function cleanedPlyName(fileName: string | undefined): string {
 
 function safeFileName(fileName: string): string {
   return fileName.replace(/[^\w.-]+/g, "_");
+}
+
+function randomJobId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
 }
 
 async function cleanupPlyFiles(inputPath: string | null, outputDir: string | null): Promise<void> {

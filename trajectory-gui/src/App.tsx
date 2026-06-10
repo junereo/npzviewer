@@ -1,11 +1,14 @@
 import { Camera, Download, FileUp, Info, RotateCcw, Scissors, SlidersHorizontal, Wand2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cleanPly, exportTrajectory, inspectCameras, inspectTrajectory, inspectVipe } from "./features/trajectory/api";
+import { convertPlyViewerAsset } from "./features/trajectory/api";
+import { GaussianViewer } from "./features/ply-viewer/GaussianViewer";
 import { TrajectoryCanvas } from "./features/trajectory/components/TrajectoryCanvas";
 import { cameraAxesFromW2c, cameraYawPitchFromW2c, describeDirection, fovFromIntrinsics } from "./features/trajectory/math.mjs";
 import { useTrajectoryStore } from "./features/trajectory/store";
 import type { CameraFrame, DepthFrameStats } from "./features/trajectory/types";
 import type { PlyCleanOptions, PlyCleanPreset, PlyCleanStats, PlyProgressEvent } from "./features/trajectory/api";
+import type { ViewerJob } from "./features/ply-viewer/types";
 
 export function App() {
   const {
@@ -680,6 +683,8 @@ function PlyCleanerApp({ onSwitchToTrajectory }: { onSwitchToTrajectory: () => v
   const [downloadName, setDownloadName] = useState("cleaned.ply");
   const [progressEvents, setProgressEvents] = useState<PlyProgressEvent[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [viewerJob, setViewerJob] = useState<ViewerJob | null>(null);
+  const [viewerBusy, setViewerBusy] = useState(false);
 
   useEffect(() => {
     return () => {
@@ -702,6 +707,22 @@ function PlyCleanerApp({ onSwitchToTrajectory }: { onSwitchToTrajectory: () => v
       preset,
       ...presetOptions[preset],
     }));
+  }
+
+  async function prepareViewer(nextFile: File | null) {
+    if (!nextFile) {
+      setViewerJob(null);
+      return;
+    }
+    setViewerBusy(true);
+    setError(null);
+    try {
+      setViewerJob(await convertPlyViewerAsset(nextFile, 500_000));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setViewerBusy(false);
+    }
   }
 
   async function runCleaner() {
@@ -733,8 +754,20 @@ function PlyCleanerApp({ onSwitchToTrajectory }: { onSwitchToTrajectory: () => v
         anchor.href = nextUrl;
         anchor.download = nextName;
         anchor.click();
+        await prepareViewer(new File([result.blob], nextName, { type: "application/octet-stream" }));
       } else {
         setDownloadUrl(null);
+        setProgressEvents((current) => [
+          ...current.slice(-11),
+          {
+            jobId: "local",
+            phase: "complete",
+            message: "Cleaned PLY was streamed to disk. Open the cleaned file to preview it in the viewer.",
+            startedAt: Date.now(),
+            updatedAt: Date.now(),
+            stats: result.stats,
+          },
+        ]);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -779,6 +812,7 @@ function PlyCleanerApp({ onSwitchToTrajectory }: { onSwitchToTrajectory: () => v
                 const nextFile = event.target.files?.[0] ?? null;
                 setFile(nextFile);
                 setStats(null);
+                void prepareViewer(nextFile);
                 if (downloadUrl) {
                   URL.revokeObjectURL(downloadUrl);
                   setDownloadUrl(null);
@@ -890,6 +924,8 @@ function PlyCleanerApp({ onSwitchToTrajectory }: { onSwitchToTrajectory: () => v
                 </div>
               ))}
             </div>
+            <GaussianViewer job={viewerJob} />
+            {viewerBusy ? <div className="busy">Preparing 3DGS viewer asset...</div> : null}
             <div className="ply-progress-panel">
               <div className="ply-progress-header">
                 <strong>{latestProgress ? latestProgress.message : "Ready"}</strong>

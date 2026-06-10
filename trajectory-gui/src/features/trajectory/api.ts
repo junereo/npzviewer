@@ -1,4 +1,5 @@
 import type { CamerasDocument, TrajectoryDocument, VipeDocument } from "./types";
+import type { ViewerJob, ViewerManifest } from "../ply-viewer/types";
 
 export type PlyCleanPreset = "light" | "medium" | "strong";
 
@@ -215,4 +216,31 @@ export async function cleanPly(
   } finally {
     events.close();
   }
+}
+
+export async function convertPlyViewerAsset(file: File, maxPoints = 500_000): Promise<ViewerJob> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("maxPoints", String(maxPoints));
+  const response = await fetch("/api/ply/viewer/convert", { method: "POST", body: form });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.json();
+}
+
+export async function loadViewerManifest(jobId: string): Promise<ViewerManifest> {
+  const response = await fetch(`/api/ply/viewer/jobs/${encodeURIComponent(jobId)}/manifest`);
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.json();
+}
+
+export async function loadViewerChunk(jobId: string, chunkName: string): Promise<ArrayBuffer> {
+  const response = await fetch(`/api/ply/viewer/jobs/${encodeURIComponent(jobId)}/chunks/${encodeURIComponent(chunkName)}`);
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.arrayBuffer();
 }

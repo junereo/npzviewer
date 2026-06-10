@@ -487,9 +487,10 @@ input {
 
 .ply-main-panel {
   display: grid;
-  grid-template-rows: minmax(260px, 1fr) auto auto;
+  grid-template-rows: auto auto auto;
   gap: 14px;
   min-height: 0;
+  align-content: start;
 }
 
 .ply-drop-zone,
@@ -501,7 +502,7 @@ input {
 
 .ply-drop-zone {
   display: grid;
-  align-content: center;
+  align-content: start;
   gap: 24px;
   padding: clamp(24px, 5vw, 56px);
   overflow: hidden;
@@ -610,6 +611,70 @@ input {
 
 .ply-live-viewer {
   gap: 12px;
+}
+
+.gaussian-viewer {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  min-height: 0;
+  overflow: hidden;
+  padding: 12px;
+  border: 1px solid #253448;
+  border-radius: 8px;
+  background: #0f141c;
+}
+
+.gaussian-viewer-header,
+.gaussian-viewer-stats {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.gaussian-viewer-header div {
+  display: grid;
+  gap: 4px;
+}
+
+.gaussian-viewer-header h2 {
+  margin: 0;
+  color: #e8edf5;
+  font-size: 16px;
+}
+
+.gaussian-viewer-header span,
+.gaussian-viewer-stats span {
+  color: #93a0b3;
+  font-size: 12px;
+}
+
+.gaussian-viewer-header strong {
+  color: #38bdf8;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.gaussian-canvas {
+  position: relative;
+  height: clamp(320px, 42vh, 520px);
+  min-height: 0;
+  contain: layout paint;
+  overflow: hidden;
+  border: 1px solid #252b36;
+  border-radius: 8px;
+  background: #05080c;
+}
+
+.gaussian-canvas > div {
+  height: 100%;
+}
+
+.gaussian-canvas canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
 }
 
 .ply-live-header {
