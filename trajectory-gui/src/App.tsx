@@ -1,10 +1,11 @@
-import { Camera, Download, FileUp, Info, RotateCcw, Scissors, Wand2, X } from "lucide-react";
+import { Camera, Download, FileUp, Info, RotateCcw, Scissors, SlidersHorizontal, Wand2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { exportTrajectory, inspectCameras, inspectTrajectory, inspectVipe } from "./features/trajectory/api";
+import { cleanPly, exportTrajectory, inspectCameras, inspectTrajectory, inspectVipe } from "./features/trajectory/api";
 import { TrajectoryCanvas } from "./features/trajectory/components/TrajectoryCanvas";
 import { cameraAxesFromW2c, cameraYawPitchFromW2c, describeDirection, fovFromIntrinsics } from "./features/trajectory/math.mjs";
 import { useTrajectoryStore } from "./features/trajectory/store";
 import type { CameraFrame, DepthFrameStats } from "./features/trajectory/types";
+import type { PlyCleanOptions, PlyCleanPreset, PlyCleanStats, PlyProgressEvent } from "./features/trajectory/api";
 
 export function App() {
   const {
@@ -39,6 +40,7 @@ export function App() {
     useTrajectoryStore();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeTool, setActiveTool] = useState<"trajectory" | "ply">("trajectory");
   const [showStructure, setShowStructure] = useState(false);
   const [showCamerasStructure, setShowCamerasStructure] = useState(false);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -166,6 +168,10 @@ export function App() {
     setCameraAlignmentMode("raw");
   }
 
+  if (activeTool === "ply") {
+    return <PlyCleanerApp onSwitchToTrajectory={() => setActiveTool("trajectory")} />;
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -174,6 +180,10 @@ export function App() {
           <p>world-to-camera pose와 intrinsics를 확인하고 Lyra-2 호환 npz로 내보냅니다.</p>
         </div>
         <div className="topbar-actions">
+          <button className="button" onClick={() => setActiveTool("ply")}>
+            <SlidersHorizontal size={18} />
+            <span>PLY Cleaner</span>
+          </button>
           <label className="button primary">
             <FileUp size={18} />
             <span>Open NPZ</span>
@@ -624,6 +634,407 @@ export function App() {
       {busy ? <div className="busy">Processing...</div> : null}
     </main>
   );
+}
+
+const presetOptions: Record<PlyCleanPreset, Pick<PlyCleanOptions, "opacityThreshold" | "epsRatio" | "minSamples" | "minClusterRatio">> = {
+  light: {
+    opacityThreshold: 0.01,
+    epsRatio: 0.004,
+    minSamples: 8,
+    minClusterRatio: 0.0005,
+  },
+  medium: {
+    opacityThreshold: 0.02,
+    epsRatio: 0.006,
+    minSamples: 12,
+    minClusterRatio: 0.002,
+  },
+  strong: {
+    opacityThreshold: 0.03,
+    epsRatio: 0.008,
+    minSamples: 20,
+    minClusterRatio: 0.005,
+  },
+};
+
+const defaultPlyOptions: PlyCleanOptions = {
+  preset: "light",
+  opacityThreshold: presetOptions.light.opacityThreshold,
+  scaleQuantile: 0.995,
+  epsRatio: presetOptions.light.epsRatio,
+  eps: null,
+  minSamples: presetOptions.light.minSamples,
+  minClusterRatio: presetOptions.light.minClusterRatio,
+  enableSor: true,
+  sorNeighbors: 12,
+  sorStdRatio: 2,
+};
+
+function PlyCleanerApp({ onSwitchToTrajectory }: { onSwitchToTrajectory: () => void }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [options, setOptions] = useState<PlyCleanOptions>(defaultPlyOptions);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [stats, setStats] = useState<PlyCleanStats | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [downloadName, setDownloadName] = useState("cleaned.ply");
+  const [progressEvents, setProgressEvents] = useState<PlyProgressEvent[]>([]);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
+  useEffect(() => {
+    return () => {
+      if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+    };
+  }, [downloadUrl]);
+
+  useEffect(() => {
+    if (!busy) return;
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      setElapsedSeconds((Date.now() - started) / 1000);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [busy]);
+
+  function updatePreset(preset: PlyCleanPreset) {
+    setOptions((current) => ({
+      ...current,
+      preset,
+      ...presetOptions[preset],
+    }));
+  }
+
+  async function runCleaner() {
+    if (!file) return;
+    setBusy(true);
+    setError(null);
+    setElapsedSeconds(0);
+    setProgressEvents([
+      {
+        jobId: "local",
+        phase: "waiting",
+        message: "Starting cleaner.",
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    try {
+      const nextName = cleanedFileName(file.name);
+      const result = await cleanPly(file, options, nextName, (event) => {
+        setProgressEvents((current) => [...current.slice(-11), event]);
+      });
+      if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+      setDownloadName(nextName);
+      setStats(result.stats);
+      if (result.blob) {
+        const nextUrl = URL.createObjectURL(result.blob);
+        setDownloadUrl(nextUrl);
+        const anchor = globalThis.document.createElement("a");
+        anchor.href = nextUrl;
+        anchor.download = nextName;
+        anchor.click();
+      } else {
+        setDownloadUrl(null);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const removedPoints = stats ? stats.inputPoints - stats.outputPoints : 0;
+  const removedPercent = stats && stats.inputPoints > 0 ? (removedPoints / stats.inputPoints) * 100 : 0;
+  const latestProgress = progressEvents.at(-1) ?? null;
+  const progressPercent = latestProgress ? progressEventPercent(latestProgress) : null;
+  const latestPointProgress = progressEvents
+    .slice()
+    .reverse()
+    .find((event) => typeof event.inputPoints === "number" && typeof event.outputPoints === "number");
+  const liveInputPoints = latestPointProgress?.inputPoints ?? stats?.inputPoints ?? null;
+  const liveOutputPoints = latestPointProgress?.outputPoints ?? stats?.outputPoints ?? null;
+  const liveRemovedPoints =
+    latestPointProgress?.removedPoints ?? (liveInputPoints !== null && liveOutputPoints !== null ? liveInputPoints - liveOutputPoints : null);
+  const liveRemovedRatio = liveInputPoints && liveRemovedPoints !== null ? liveRemovedPoints / liveInputPoints : 0;
+
+  return (
+    <main className="app-shell ply-shell">
+      <header className="topbar">
+        <div>
+          <h1>Lyra PLY Cleaner</h1>
+          <p>Lyra 2.0 / 3DGS PLY를 업로드하고 outlier Gaussian을 제거한 PLY를 저장합니다.</p>
+        </div>
+        <div className="topbar-actions">
+          <button className="button" onClick={onSwitchToTrajectory}>
+            <Camera size={18} />
+            <span>Trajectory GUI</span>
+          </button>
+          <label className="button primary">
+            <FileUp size={18} />
+            <span>Open PLY</span>
+            <input
+              type="file"
+              accept=".ply"
+              onChange={(event) => {
+                const nextFile = event.target.files?.[0] ?? null;
+                setFile(nextFile);
+                setStats(null);
+                if (downloadUrl) {
+                  URL.revokeObjectURL(downloadUrl);
+                  setDownloadUrl(null);
+                }
+              }}
+            />
+          </label>
+          <button className="button" disabled={!file || busy} onClick={() => void runCleaner()}>
+            <Wand2 size={18} />
+            <span>{busy ? "Cleaning..." : "Clean PLY"}</span>
+          </button>
+          <a className={downloadUrl ? "button" : "button disabled-link"} href={downloadUrl ?? undefined} download={downloadName}>
+            <Download size={18} />
+            <span>Download</span>
+          </a>
+        </div>
+      </header>
+
+      {error ? <div className="error">{error}</div> : null}
+      {busy ? <div className="busy">Processing PLY...</div> : null}
+
+      <section className="ply-workspace">
+        <aside className="panel ply-options-panel">
+          <h2>Cleaner Settings</h2>
+          <div className="alignment-control">
+            <span>Preset</span>
+            <div className="segmented">
+              {(["light", "medium", "strong"] as const).map((preset) => (
+                <button key={preset} className={options.preset === preset ? "active" : ""} onClick={() => updatePreset(preset)}>
+                  {preset}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <section className="editor-section">
+            <h3>Opacity and scale</h3>
+            <NumberField
+              label="Opacity threshold"
+              value={options.opacityThreshold}
+              onChange={(opacityThreshold) => setOptions((current) => ({ ...current, opacityThreshold }))}
+            />
+            <NumberField
+              label="Scale quantile"
+              value={options.scaleQuantile}
+              onChange={(scaleQuantile) => setOptions((current) => ({ ...current, scaleQuantile }))}
+            />
+          </section>
+
+          <section className="editor-section">
+            <h3>DBSCAN</h3>
+            <NumberField label="EPS ratio" value={options.epsRatio} onChange={(epsRatio) => setOptions((current) => ({ ...current, epsRatio }))} />
+            <NumberField
+              label="Absolute EPS"
+              value={options.eps ?? 0}
+              onChange={(eps) => setOptions((current) => ({ ...current, eps: eps > 0 ? eps : null }))}
+            />
+            <NumberField
+              label="Min samples"
+              value={options.minSamples}
+              onChange={(minSamples) => setOptions((current) => ({ ...current, minSamples }))}
+            />
+            <NumberField
+              label="Min cluster ratio"
+              value={options.minClusterRatio}
+              onChange={(minClusterRatio) => setOptions((current) => ({ ...current, minClusterRatio }))}
+            />
+          </section>
+
+          <section className="editor-section">
+            <h3>Statistical outlier removal</h3>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={options.enableSor}
+                onChange={(event) => setOptions((current) => ({ ...current, enableSor: event.target.checked }))}
+              />
+              <span>Enable SOR</span>
+            </label>
+            <NumberField
+              label="SOR neighbors"
+              value={options.sorNeighbors}
+              onChange={(sorNeighbors) => setOptions((current) => ({ ...current, sorNeighbors }))}
+            />
+            <NumberField
+              label="SOR std ratio"
+              value={options.sorStdRatio}
+              onChange={(sorStdRatio) => setOptions((current) => ({ ...current, sorStdRatio }))}
+            />
+          </section>
+        </aside>
+
+        <section className="ply-main-panel">
+          <div className="ply-drop-zone">
+            <div className="ply-file-card">
+              <FileUp size={28} />
+              <div>
+                <strong>{file ? file.name : "No PLY selected"}</strong>
+                <span>{file ? formatBytes(file.size) : "Open a Lyra 2.0 / 3DGS .ply file to begin."}</span>
+              </div>
+            </div>
+            <div className="ply-pipeline">
+              {["uploading", "processing", "downloading", "saving", "complete"].map((step) => (
+                <div key={step} className={latestProgress?.phase === step ? "ply-step active" : "ply-step"}>
+                  <span>{step}</span>
+                </div>
+              ))}
+            </div>
+            <div className="ply-progress-panel">
+              <div className="ply-progress-header">
+                <strong>{latestProgress ? latestProgress.message : "Ready"}</strong>
+                <span>{busy ? `${elapsedSeconds.toFixed(1)}s elapsed` : stats ? "Finished" : "Idle"}</span>
+              </div>
+              <div className="ply-progress-bar" aria-label="PLY processing progress">
+                <span style={{ width: progressPercent === null ? "0%" : `${Math.min(100, Math.max(0, progressPercent))}%` }} />
+              </div>
+              <div className="ply-progress-meta">
+                <span>Phase: {latestProgress?.phase ?? "ready"}</span>
+                <span>{progressPercent === null ? "Progress is stage-based" : `${progressPercent.toFixed(1)}%`}</span>
+              </div>
+            </div>
+            <div className="ply-live-viewer">
+              <div className="ply-live-header">
+                <div>
+                  <h2>Live Point Viewer</h2>
+                  <span>{latestPointProgress?.step ? `Current filter: ${latestPointProgress.step}` : "Waiting for filter counts"}</span>
+                </div>
+                <strong>{liveOutputPoints !== null ? formatInteger(liveOutputPoints) : "-"}</strong>
+              </div>
+              <div className="ply-count-track">
+                <span className="remaining" style={{ width: `${Math.max(0, Math.min(100, (1 - liveRemovedRatio) * 100))}%` }} />
+                <span className="removed" style={{ width: `${Math.max(0, Math.min(100, liveRemovedRatio * 100))}%` }} />
+              </div>
+              <div className="ply-count-cloud" aria-hidden="true">
+                {Array.from({ length: 84 }).map((_, index) => (
+                  <i
+                    key={index}
+                    className={liveInputPoints && index / 84 < liveRemovedRatio ? "removed" : "remaining"}
+                    style={{
+                      left: `${((index * 37) % 97) + 1}%`,
+                      top: `${((index * 53) % 89) + 5}%`,
+                    }}
+                  />
+                ))}
+              </div>
+              <div className="ply-progress-meta">
+                <span>Original: {liveInputPoints !== null ? formatInteger(liveInputPoints) : "-"}</span>
+                <span>Removed: {liveRemovedPoints !== null ? formatInteger(liveRemovedPoints) : "-"}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="ply-results-grid">
+            <PlyMetric label="Input points" value={stats ? formatInteger(stats.inputPoints) : "-"} />
+            <PlyMetric label="Output points" value={stats ? formatInteger(stats.outputPoints) : "-"} />
+            <PlyMetric label="Removed" value={stats ? `${formatInteger(removedPoints)} (${removedPercent.toFixed(1)}%)` : "-"} />
+            <PlyMetric label="EPS" value={stats ? stats.eps.toPrecision(4) : options.eps ? String(options.eps) : "auto"} />
+          </div>
+
+          <div className="ply-detail-panel">
+            <h2>Removal Breakdown</h2>
+            <div className="ply-breakdown">
+              <PlyMetric label="Opacity" value={stats ? formatInteger(stats.removedOpacity) : "-"} />
+              <PlyMetric label="Scale" value={stats ? formatInteger(stats.removedScale) : "-"} />
+              <PlyMetric label="SOR" value={stats ? formatInteger(stats.removedSor) : "-"} />
+              <PlyMetric label="DBSCAN" value={stats ? formatInteger(stats.removedDbscan) : "-"} />
+            </div>
+            <div className="camera-analysis">
+              <span>Vertex row 전체를 같은 mask로 필터링하므로 SH color, rotation, scale, opacity 속성이 함께 유지됩니다.</span>
+              <span>처음에는 light, medium, strong 결과를 각각 만들어 SIBR 또는 Unreal viewer에서 비교하는 흐름이 안전합니다.</span>
+              <span>Absolute EPS를 0으로 두면 bbox diagonal x EPS ratio로 자동 계산합니다.</span>
+            </div>
+            <div className="ply-log-panel">
+              <h2>Processing Log</h2>
+              {progressEvents.length ? (
+                progressEvents
+                  .slice()
+                  .reverse()
+                  .map((event, index) => (
+                    <div className="ply-log-row" key={`${event.updatedAt}-${index}`}>
+                      <strong>{event.phase}</strong>
+                      <span>{event.message}</span>
+                      <small>{formatProgressDetail(event)}</small>
+                    </div>
+                  ))
+              ) : (
+                <div className="ply-log-row">
+                  <strong>ready</strong>
+                  <span>Select a PLY file and run the cleaner.</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+  );
+}
+
+function progressEventPercent(event: PlyProgressEvent): number | null {
+  if (event.phase === "uploading" && event.uploadedBytes !== undefined && event.totalBytes) {
+    return (event.uploadedBytes / event.totalBytes) * 100;
+  }
+  if (event.phase === "saving" && event.downloadedBytes !== undefined && event.downloadTotalBytes) {
+    return (event.downloadedBytes / event.downloadTotalBytes) * 100;
+  }
+  const phasePercent: Record<string, number> = {
+    waiting: 2,
+    uploaded: 30,
+    processing: 55,
+    downloading: 78,
+    saving: 88,
+    complete: 100,
+    error: 100,
+  };
+  return phasePercent[event.phase] ?? null;
+}
+
+function formatProgressDetail(event: PlyProgressEvent): string {
+  if (event.phase === "uploading" && event.uploadedBytes !== undefined) {
+    return `${formatBytes(event.uploadedBytes)}${event.totalBytes ? ` / ${formatBytes(event.totalBytes)}` : ""}`;
+  }
+  if (event.phase === "saving" && event.downloadedBytes !== undefined) {
+    return `${formatBytes(event.downloadedBytes)}${event.downloadTotalBytes ? ` / ${formatBytes(event.downloadTotalBytes)}` : ""}`;
+  }
+  if (event.stats) {
+    return `${formatInteger(event.stats.inputPoints)} -> ${formatInteger(event.stats.outputPoints)} points`;
+  }
+  if (event.inputPoints !== undefined && event.outputPoints !== undefined) {
+    return `${formatInteger(event.inputPoints)} -> ${formatInteger(event.outputPoints)} points`;
+  }
+  return new Date(event.updatedAt).toLocaleTimeString();
+}
+
+function PlyMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="ply-metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function cleanedFileName(fileName: string): string {
+  return fileName.toLowerCase().endsWith(".ply") ? fileName.replace(/\.ply$/i, "_cleaned.ply") : `${fileName}_cleaned.ply`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function formatInteger(value: number): string {
+  return new Intl.NumberFormat("en-US").format(value);
 }
 
 function CamerasStructureModal({
