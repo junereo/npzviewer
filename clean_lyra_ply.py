@@ -270,9 +270,16 @@ def clean_3dgs_ply(
     enable_sor: bool = True,
     sor_neighbors: int = 12,
     sor_std_ratio: float = 2.0,
+    large_point_threshold: int = 2_000_000,
     progress_callback: ProgressCallback | None = None,
 ) -> CleanStats:
-    def progress(step: str, keep_mask: np.ndarray | None, message: str, eps_value: float | None = None) -> None:
+    def progress(
+        step: str,
+        keep_mask: np.ndarray | None,
+        message: str,
+        eps_value: float | None = None,
+        **extra: int | float | str | bool | None,
+    ) -> None:
         if progress_callback is None:
             return
         output_points = int(keep_mask.sum()) if keep_mask is not None else int(len(data))
@@ -284,6 +291,7 @@ def clean_3dgs_ply(
                 "outputPoints": output_points,
                 "removedPoints": int(len(data) - output_points),
                 "eps": eps_value,
+                **extra,
             }
         )
 
@@ -319,12 +327,24 @@ def clean_3dgs_ply(
     progress("scale", keep, "Scale outlier filter applied.")
 
     before = keep.copy()
-    if enable_sor and keep.sum() > max(sor_neighbors + 1, 4):
+    large_mode = int(keep.sum()) >= large_point_threshold
+    if enable_sor and large_mode:
+        progress(
+            "sor",
+            keep,
+            "SOR skipped for large PLY. Using fast voxel cluster filtering instead.",
+            skipped=True,
+            largeMode=True,
+            threshold=large_point_threshold,
+        )
+    elif enable_sor and keep.sum() > max(sor_neighbors + 1, 4):
         keep_indices = np.flatnonzero(keep)
         sor_keep = statistical_outlier_mask(xyz[keep], sor_neighbors, sor_std_ratio)
         keep[keep_indices] = sor_keep
+        progress("sor", keep, "Statistical outlier removal applied.")
+    else:
+        progress("sor", keep, "Statistical outlier removal skipped.", skipped=True)
     removed_sor = int(before.sum() - keep.sum())
-    progress("sor", keep, "Statistical outlier removal applied.")
 
     xyz_kept = xyz[keep]
     if len(xyz_kept) == 0:
@@ -338,16 +358,25 @@ def clean_3dgs_ply(
 
     before = keep.copy()
     if eps_value > 0 and min_samples > 1 and len(xyz_kept) >= min_samples:
-        labels = dbscan_labels(xyz_kept, eps_value, min_samples)
-        cluster_keep = labels != -1
-        valid_labels = labels[cluster_keep]
-        if len(valid_labels):
-            unique, counts = np.unique(valid_labels, return_counts=True)
-            min_cluster_size = max(1, int(len(xyz_kept) * min_cluster_ratio))
-            large_labels = set(unique[counts >= min_cluster_size].tolist())
-            cluster_keep &= np.array([label in large_labels for label in labels], dtype=bool)
+        if len(xyz_kept) >= large_point_threshold:
+            cluster_keep = voxel_cluster_mask(
+                xyz_kept,
+                eps_value,
+                min_samples,
+                min_cluster_ratio,
+                lambda event: progress("voxel_cluster", keep, "Fast voxel cluster filtering is running.", eps_value, **event),
+            )
         else:
-            cluster_keep[:] = False
+            labels = dbscan_labels(xyz_kept, eps_value, min_samples)
+            cluster_keep = labels != -1
+            valid_labels = labels[cluster_keep]
+            if len(valid_labels):
+                unique, counts = np.unique(valid_labels, return_counts=True)
+                min_cluster_size = max(min_samples, int(len(xyz_kept) * min_cluster_ratio))
+                large_labels = set(unique[counts >= min_cluster_size].tolist())
+                cluster_keep &= np.array([label in large_labels for label in labels], dtype=bool)
+            else:
+                cluster_keep[:] = False
         keep[np.flatnonzero(keep)] = cluster_keep
     removed_dbscan = int(before.sum() - keep.sum())
     progress("dbscan", keep, "DBSCAN floating cluster filter applied.", eps_value)
@@ -402,6 +431,68 @@ def dbscan_labels(points: np.ndarray, eps: float, min_samples: int) -> np.ndarra
 
     labels[labels == -99] = -1
     return labels
+
+
+def voxel_cluster_mask(
+    points: np.ndarray,
+    cell_size: float,
+    min_samples: int,
+    min_cluster_ratio: float,
+    progress_callback: Callable[[dict[str, int | float | str | bool | None]], None] | None = None,
+) -> np.ndarray:
+    if len(points) == 0:
+        return np.zeros(0, dtype=bool)
+    if cell_size <= 0:
+        return np.ones(len(points), dtype=bool)
+
+    progress_callback and progress_callback({"stage": "voxelizing", "processed": 0, "total": int(len(points))})
+    cells = np.floor(points / cell_size).astype(np.int64)
+    unique_cells, inverse, counts = np.unique(cells, axis=0, return_inverse=True, return_counts=True)
+    occupied = {tuple(cell.tolist()): index for index, cell in enumerate(unique_cells)}
+    visited = np.zeros(len(unique_cells), dtype=bool)
+    keep_cells = np.zeros(len(unique_cells), dtype=bool)
+    min_cluster_size = max(min_samples, int(len(points) * min_cluster_ratio))
+    neighbor_offsets = [
+        (dx, dy, dz)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dz in (-1, 0, 1)
+        if not (dx == 0 and dy == 0 and dz == 0)
+    ]
+
+    for start in range(len(unique_cells)):
+        if visited[start]:
+            continue
+        queue: deque[int] = deque([start])
+        visited[start] = True
+        component: list[int] = []
+        point_count = 0
+        while queue:
+            cell_index = queue.popleft()
+            component.append(cell_index)
+            point_count += int(counts[cell_index])
+            base = unique_cells[cell_index]
+            for dx, dy, dz in neighbor_offsets:
+                neighbor_key = (int(base[0] + dx), int(base[1] + dy), int(base[2] + dz))
+                neighbor_index = occupied.get(neighbor_key)
+                if neighbor_index is None or visited[neighbor_index]:
+                    continue
+                visited[neighbor_index] = True
+                queue.append(neighbor_index)
+        if point_count >= min_cluster_size:
+            keep_cells[component] = True
+        if progress_callback and (start % 2000 == 0 or start == len(unique_cells) - 1):
+            progress_callback(
+                {
+                    "stage": "connected_components",
+                    "processed": int(visited.sum()),
+                    "total": int(len(unique_cells)),
+                    "keptVoxels": int(keep_cells.sum()),
+                    "minClusterSize": int(min_cluster_size),
+                }
+            )
+
+    return keep_cells[inverse]
 
 
 def radius_neighbors(points: np.ndarray, eps: float, index: int) -> list[int]:
@@ -519,6 +610,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-sor", action="store_true", help="Disable statistical outlier removal")
     parser.add_argument("--sor-neighbors", type=int, default=12, help="Neighbor count for statistical outlier removal")
     parser.add_argument("--sor-std-ratio", type=float, default=2.0, help="SOR distance stddev multiplier")
+    parser.add_argument("--large-point-threshold", type=int, default=2_000_000, help="Use fast large-file mode at or above this point count")
     return parser
 
 
@@ -539,6 +631,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_sor=not args.no_sor,
         sor_neighbors=args.sor_neighbors,
         sor_std_ratio=args.sor_std_ratio,
+        large_point_threshold=args.large_point_threshold,
         **options,
     )
 

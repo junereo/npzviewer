@@ -665,7 +665,7 @@ const defaultPlyOptions: PlyCleanOptions = {
   eps: null,
   minSamples: presetOptions.light.minSamples,
   minClusterRatio: presetOptions.light.minClusterRatio,
-  enableSor: true,
+  enableSor: false,
   sorNeighbors: 12,
   sorStdRatio: 2,
 };
@@ -848,9 +848,12 @@ function PlyCleanerApp({ onSwitchToTrajectory }: { onSwitchToTrajectory: () => v
             />
           </section>
 
-          <section className="editor-section">
-            <h3>Statistical outlier removal</h3>
-            <label className="toggle-row">
+            <section className="editor-section">
+              <h3>Statistical outlier removal</h3>
+              <div className="camera-analysis">
+                <span>Large files use fast voxel cluster filtering after opacity/scale. Enable SOR only for smaller test PLY files.</span>
+              </div>
+              <label className="toggle-row">
               <input
                 type="checkbox"
                 checked={options.enableSor}

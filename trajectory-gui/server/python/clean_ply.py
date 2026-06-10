@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-sor", action="store_true")
     parser.add_argument("--sor-neighbors", type=int, default=12)
     parser.add_argument("--sor-std-ratio", type=float, default=2.0)
+    parser.add_argument("--large-point-threshold", type=int, default=2_000_000)
     parser.add_argument("--progress", action="store_true", help="Emit progress JSON lines to stderr.")
     return parser
 
@@ -50,6 +51,7 @@ def main() -> int:
         enable_sor=not args.no_sor,
         sor_neighbors=args.sor_neighbors,
         sor_std_ratio=args.sor_std_ratio,
+        large_point_threshold=args.large_point_threshold,
         progress_callback=emit_progress if args.progress else None,
         **options,
     )

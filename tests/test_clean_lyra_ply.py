@@ -58,6 +58,30 @@ class CleanLyraPlyTests(unittest.TestCase):
             self.assertEqual(vertex["f_dc_0"].tolist(), [10.0, 11.0, 12.0, 13.0])
             self.assertIn("camera", cleaned.elements)
 
+    def test_large_mode_skips_sor_and_uses_voxel_cluster_filter(self) -> None:
+        events = []
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "input.ply"
+            output_path = Path(tmp) / "cleaned.ply"
+            input_path.write_text(SAMPLE_PLY, encoding="ascii")
+
+            stats = clean_3dgs_ply(
+                input_path,
+                output_path,
+                opacity_threshold=0.01,
+                scale_quantile=0.85,
+                eps=0.05,
+                min_samples=2,
+                min_cluster_ratio=0.0,
+                enable_sor=True,
+                large_point_threshold=5,
+                progress_callback=events.append,
+            )
+
+            self.assertEqual(stats.output_points, 4)
+            self.assertTrue(any(event["step"] == "sor" and event["skipped"] for event in events))
+            self.assertTrue(any(event["step"] == "voxel_cluster" for event in events))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -172,6 +172,8 @@ app.post("/api/ply/clean", trackPlyUploadProgress, plyUpload.single("file"), asy
       String(options.sorNeighbors),
       "--sor-std-ratio",
       String(options.sorStdRatio),
+      "--large-point-threshold",
+      "2000000",
       "--progress",
     ];
     if (options.eps !== undefined) {
