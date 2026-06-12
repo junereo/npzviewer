@@ -1,5 +1,5 @@
 import { Camera, Download, FileUp, Info, RotateCcw, Scissors, SlidersHorizontal, Wand2, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cleanPly, exportTrajectory, inspectCameras, inspectTrajectory, inspectVipe } from "./features/trajectory/api";
 import { convertPlyViewerAsset } from "./features/trajectory/api";
 import { GaussianViewer } from "./features/ply-viewer/GaussianViewer";
@@ -9,6 +9,8 @@ import { useTrajectoryStore } from "./features/trajectory/store";
 import type { CameraFrame, DepthFrameStats } from "./features/trajectory/types";
 import type { PlyCleanOptions, PlyCleanPreset, PlyCleanStats, PlyProgressEvent } from "./features/trajectory/api";
 import type { ViewerJob } from "./features/ply-viewer/types";
+
+const SplatEditorApp = lazy(() => import("./features/splat-editor/SplatEditorApp").then((module) => ({ default: module.SplatEditorApp })));
 
 export function App() {
   const {
@@ -43,7 +45,7 @@ export function App() {
     useTrajectoryStore();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTool, setActiveTool] = useState<"trajectory" | "ply">("trajectory");
+  const [activeTool, setActiveTool] = useState<"trajectory" | "ply" | "splat-editor">("trajectory");
   const [showStructure, setShowStructure] = useState(false);
   const [showCamerasStructure, setShowCamerasStructure] = useState(false);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -175,6 +177,14 @@ export function App() {
     return <PlyCleanerApp onSwitchToTrajectory={() => setActiveTool("trajectory")} />;
   }
 
+  if (activeTool === "splat-editor") {
+    return (
+      <Suspense fallback={<main className="app-shell"><div className="busy">Loading Splat Editor...</div></main>}>
+        <SplatEditorApp onSwitchToTrajectory={() => setActiveTool("trajectory")} />
+      </Suspense>
+    );
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -186,6 +196,10 @@ export function App() {
           <button className="button" onClick={() => setActiveTool("ply")}>
             <SlidersHorizontal size={18} />
             <span>PLY Cleaner</span>
+          </button>
+          <button className="button" onClick={() => setActiveTool("splat-editor")}>
+            <Scissors size={18} />
+            <span>Splat Editor</span>
           </button>
           <label className="button primary">
             <FileUp size={18} />
