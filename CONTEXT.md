@@ -33,15 +33,26 @@ full authoring surface for Gaussian editing.
 _Avoid_: editor, splat editor
 
 **Splat Editor**:
-The planned PlayCanvas and GSplat based authoring surface for 3DGS PLY files. It
-loads Splats, renders them as Gaussian splats, tracks edit state, and exports an
-edited result.
+The top-level tab for 3DGS PLY authoring. It contains the upstream SuperSplat
+Full Editor by default and the local Lyra Tools editor for project-specific
+inspection and export workflows.
 _Avoid_: PLY cleaner, viewer
 
+**SuperSplat Full Editor**:
+The vendored upstream PlayCanvas SuperSplat app served from `/supersplat/`. Use
+this name when referring to the feature-complete MIT editor copied from
+PlayCanvas.
+_Avoid_: Lyra editor, local editor
+
+**Lyra Tools**:
+The local React and PlayCanvas GSplat editor mode that owns Lyra-specific PLY
+selection, hide, lock, histogram, and edited PLY export behavior.
+_Avoid_: SuperSplat
+
 **Selection State**:
-Per-Splat editor state such as selected or deleted. It is metadata layered over
-the original Splat data until export, and delete means a non-destructive mark
-that excludes the Splat from the edited PLY.
+Per-Splat editor state such as selected, deleted, hidden, or locked. It is
+metadata layered over the original Splat data until export; delete excludes the
+Splat from the edited PLY, while hide and lock only affect editor interaction.
 _Avoid_: vertex flags, PLY properties
 
 **Transform Palette**:

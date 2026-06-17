@@ -1,17 +1,27 @@
 import * as pc from "playcanvas";
-import type { EditorTool, SplatSceneSummary } from "../types";
+import type { EditorTool, HistogramAxis, SplatSceneSummary } from "../types";
 import { createPlayCanvasApp, type PlayCanvasAppHandle } from "./createPlayCanvasApp";
 import { exportEditedPlyBytes } from "./exportEditedPly.mjs";
+import { buildAxisHistogram, indicesInAxisRange, selectedBounds } from "./histogram.mjs";
 import { loadGsplatAsset } from "./loadGsplatAsset";
 import { parsePlySceneData } from "./plyData.mjs";
 import { SplatEditState } from "./SplatEditState.mjs";
 
 type PointerState = {
+  startX: number;
+  startY: number;
   x: number;
   y: number;
   pointerId: number;
   moved: boolean;
 };
+
+export type BoxDragRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+} | null;
 
 export class PlayCanvasSplatEditor {
   private handle: PlayCanvasAppHandle | null = null;
@@ -31,6 +41,7 @@ export class PlayCanvasSplatEditor {
   constructor(
     private readonly canvas: HTMLCanvasElement,
     private readonly onSceneChange: (summary: SplatSceneSummary | null) => void,
+    private readonly onBoxDrag: (rect: BoxDragRect) => void = () => {},
   ) {}
 
   async mount(): Promise<void> {
@@ -98,6 +109,8 @@ export class PlayCanvasSplatEditor {
       hiddenCount: 0,
       lockedCount: 0,
       bounds,
+      selectedBounds: null,
+      histogram: buildAxisHistogram(sceneData.centers, "x", 24),
       format: sceneData.format,
     };
     this.summary = summary;
@@ -126,15 +139,39 @@ export class PlayCanvasSplatEditor {
   deleteSelection(): SplatSceneSummary | null {
     if (!this.editState || !this.summary) return null;
     this.editState.markDeletedSelection();
-    this.summary = { ...this.summary, selectedCount: this.editState.selectedCount, deletedCount: this.editState.deletedCount };
+    this.syncSummaryFromState();
     this.emitSummary();
     return this.summary;
   }
 
   restoreSelection(): SplatSceneSummary | null {
     if (!this.editState || !this.summary) return null;
-    this.editState.restoreDeleted(this.editState.deletedIndices());
-    this.summary = { ...this.summary, deletedCount: this.editState.deletedCount };
+    this.editState.restoreAll();
+    this.syncSummaryFromState();
+    this.emitSummary();
+    return this.summary;
+  }
+
+  hideSelection(): SplatSceneSummary | null {
+    if (!this.editState || !this.summary) return null;
+    this.editState.hideSelection();
+    this.syncSummaryFromState();
+    this.emitSummary();
+    return this.summary;
+  }
+
+  lockSelection(): SplatSceneSummary | null {
+    if (!this.editState || !this.summary) return null;
+    this.editState.lockSelection();
+    this.syncSummaryFromState();
+    this.emitSummary();
+    return this.summary;
+  }
+
+  unlockAll(): SplatSceneSummary | null {
+    if (!this.editState || !this.summary) return null;
+    this.editState.unlockAll();
+    this.syncSummaryFromState();
     this.emitSummary();
     return this.summary;
   }
@@ -142,7 +179,23 @@ export class PlayCanvasSplatEditor {
   clearSelection(): SplatSceneSummary | null {
     if (!this.editState || !this.summary) return null;
     this.editState.clearSelection();
-    this.summary = { ...this.summary, selectedCount: 0 };
+    this.syncSummaryFromState();
+    this.emitSummary();
+    return this.summary;
+  }
+
+  setHistogramAxis(axis: HistogramAxis): SplatSceneSummary | null {
+    if (!this.centers || !this.summary) return null;
+    this.summary = { ...this.summary, histogram: buildAxisHistogram(this.centers, axis, 24) };
+    this.emitSummary();
+    return this.summary;
+  }
+
+  selectHistogramRange(axis: HistogramAxis, min: number, max: number): SplatSceneSummary | null {
+    if (!this.centers || !this.editState || !this.summary) return null;
+    const indices = indicesInAxisRange(this.centers, axis, min, max, (index: number) => this.editState?.isSelectable(index) ?? false);
+    this.editState.selectOnly(indices);
+    this.syncSummaryFromState();
     this.emitSummary();
     return this.summary;
   }
@@ -154,7 +207,7 @@ export class PlayCanvasSplatEditor {
 
   private readonly onPointerDown = (event: PointerEvent) => {
     this.canvas.setPointerCapture(event.pointerId);
-    this.pointer = { x: event.clientX, y: event.clientY, pointerId: event.pointerId, moved: false };
+    this.pointer = { startX: event.clientX, startY: event.clientY, x: event.clientX, y: event.clientY, pointerId: event.pointerId, moved: false };
   };
 
   private readonly onPointerMove = (event: PointerEvent) => {
@@ -167,6 +220,8 @@ export class PlayCanvasSplatEditor {
       this.yaw -= dx * 0.25;
       this.pitch = clamp(this.pitch - dy * 0.18, -85, 85);
       this.updateCamera();
+    } else if (this.activeTool === "box-select") {
+      this.onBoxDrag(clientRectToLocal(this.canvas, this.pointer.startX, this.pointer.startY, event.clientX, event.clientY));
     }
 
     this.pointer.x = event.clientX;
@@ -180,6 +235,9 @@ export class PlayCanvasSplatEditor {
     this.canvas.releasePointerCapture(pointer.pointerId);
     if (this.activeTool === "pick" && !pointer.moved) {
       this.pickAt(event, { add: event.shiftKey, remove: event.ctrlKey || event.metaKey });
+    } else if (this.activeTool === "box-select" && pointer.moved) {
+      this.boxSelect(pointer, event, { add: event.shiftKey, remove: event.ctrlKey || event.metaKey });
+      this.onBoxDrag(null);
     }
   };
 
@@ -215,7 +273,36 @@ export class PlayCanvasSplatEditor {
     if (mode.remove) this.editState.removeSelection([best.index]);
     else if (mode.add) this.editState.addSelection([best.index]);
     else this.editState.selectOnly([best.index]);
-    this.summary = { ...this.summary, selectedCount: this.editState.selectedCount };
+    this.syncSummaryFromState();
+    this.emitSummary();
+  }
+
+  private boxSelect(pointer: PointerState, event: PointerEvent, mode: { add: boolean; remove: boolean }): void {
+    if (!this.handle || !this.centers || !this.editState || !this.summary) return;
+    const camera = this.handle.camera as pc.Entity & { camera: { worldToScreen: (world: pc.Vec3, out?: pc.Vec3) => pc.Vec3 } };
+    const rect = this.canvas.getBoundingClientRect();
+    const left = Math.min(pointer.startX, event.clientX) - rect.left;
+    const right = Math.max(pointer.startX, event.clientX) - rect.left;
+    const top = Math.min(pointer.startY, event.clientY) - rect.top;
+    const bottom = Math.max(pointer.startY, event.clientY) - rect.top;
+    const temp = new pc.Vec3();
+    const selected = [];
+
+    for (let cursor = 0; cursor + 2 < this.centers.length; cursor += 3) {
+      const index = cursor / 3;
+      if (!this.editState.isSelectable(index)) continue;
+      temp.set(this.centers[cursor], this.centers[cursor + 1], this.centers[cursor + 2]);
+      const projected = camera.camera.worldToScreen(temp, temp);
+      if (projected.z < 0) continue;
+      if (projected.x >= left && projected.x <= right && projected.y >= top && projected.y <= bottom) {
+        selected.push(index);
+      }
+    }
+
+    if (mode.remove) this.editState.removeSelection(selected);
+    else if (mode.add) this.editState.addSelection(selected);
+    else this.editState.selectOnly(selected);
+    this.syncSummaryFromState();
     this.emitSummary();
   }
 
@@ -246,8 +333,43 @@ export class PlayCanvasSplatEditor {
   private emitSummary(): void {
     this.onSceneChange(this.summary);
   }
+
+  private syncSummaryFromState(): void {
+    if (!this.summary || !this.editState) return;
+    this.summary = {
+      ...this.summary,
+      selectedCount: this.editState.selectedCount,
+      deletedCount: this.editState.deletedCount,
+      hiddenCount: this.editState.hiddenCount,
+      lockedCount: this.editState.lockedCount,
+      selectedBounds: this.centers ? tupleBounds(selectedBounds(this.centers, this.editState.selectedIndices())) : null,
+    };
+  }
 }
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function clientRectToLocal(canvas: HTMLCanvasElement, startX: number, startY: number, endX: number, endY: number): NonNullable<BoxDragRect> {
+  const rect = canvas.getBoundingClientRect();
+  const x1 = startX - rect.left;
+  const y1 = startY - rect.top;
+  const x2 = endX - rect.left;
+  const y2 = endY - rect.top;
+  return {
+    x: Math.min(x1, x2),
+    y: Math.min(y1, y2),
+    width: Math.abs(x2 - x1),
+    height: Math.abs(y2 - y1),
+  };
+}
+
+function tupleBounds(bounds: { min: number[]; max: number[] } | null) {
+  return bounds
+    ? {
+        min: bounds.min as [number, number, number],
+        max: bounds.max as [number, number, number],
+      }
+    : null;
 }

@@ -117,6 +117,8 @@ Use these names consistently:
 - Delete is non-destructive inside the editor. It marks Splats as deleted in `Selection State`; restore clears that mark; export omits marked Splats from the edited PLY.
 - First implementation uses CPU Centers Selection: keep splat centers in a CPU-readable array, project them into screen space, and choose the nearest center for click selection. Large box, brush, and lasso selection performance is follow-up work.
 - The first Splat Editor milestone is an independent PLY editor. Trajectory, Cameras, VIPE, and video synchronization remain in the existing workflow until a separate coordinate alignment pass is designed.
+- Second implementation expands editor metadata with hidden and locked states. Hidden Splats are excluded from editor selection, locked Splats are protected from selection/edit commands, and neither state removes Splats from edited PLY export.
+- Second implementation adds Box selection and axis histogram range selection as CPU operations that run only on drag completion or explicit histogram bin selection.
 
 ## Dependency Strategy
 

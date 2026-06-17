@@ -40,3 +40,23 @@ export function findNearestProjectedCenter(centers, viewProjectionMatrix, viewpo
 
   return best ? { index: best.index, distancePx: Math.sqrt(best.distanceSquared) } : null;
 }
+
+export function findProjectedCentersInRect(centers, viewProjectionMatrix, viewport, rect, pred = null) {
+  const left = Math.min(rect.x1, rect.x2);
+  const right = Math.max(rect.x1, rect.x2);
+  const top = Math.min(rect.y1, rect.y2);
+  const bottom = Math.max(rect.y1, rect.y2);
+  const indices = [];
+
+  for (let cursor = 0; cursor + 2 < centers.length; cursor += 3) {
+    const index = cursor / 3;
+    if (pred && !pred(index)) continue;
+    const projected = projectPointToScreen([centers[cursor], centers[cursor + 1], centers[cursor + 2]], viewProjectionMatrix, viewport);
+    if (!projected) continue;
+    if (projected.x >= left && projected.x <= right && projected.y >= top && projected.y <= bottom) {
+      indices.push(index);
+    }
+  }
+
+  return indices;
+}

@@ -53,3 +53,47 @@ test("SplatEditState ignores out-of-range and duplicate indices", () => {
   assert.equal(state.deletedCount, 1);
   assert.deepEqual(state.deletedIndices(), [1]);
 });
+
+test("SplatEditState hides selection without deleting it", () => {
+  const state = new SplatEditState(5);
+
+  state.selectOnly([1, 3]);
+  state.hideSelection();
+
+  assert.equal(state.selectedCount, 0);
+  assert.equal(state.hiddenCount, 2);
+  assert.equal(state.deletedCount, 0);
+  assert.deepEqual(state.hiddenIndices(), [1, 3]);
+});
+
+test("SplatEditState locked splats are protected from selection and delete", () => {
+  const state = new SplatEditState(5);
+
+  state.selectOnly([2]);
+  state.lockSelection();
+  state.selectOnly([2, 3]);
+  state.markDeletedSelection();
+
+  assert.equal(state.lockedCount, 1);
+  assert.deepEqual(state.lockedIndices(), [2]);
+  assert.deepEqual(state.deletedIndices(), [3]);
+});
+
+test("SplatEditState restoreAll clears deleted and hidden but keeps locks explicit until unlockAll", () => {
+  const state = new SplatEditState(6);
+
+  state.selectOnly([1, 2]);
+  state.hideSelection();
+  state.selectOnly([3]);
+  state.markDeletedSelection();
+  state.selectOnly([4]);
+  state.lockSelection();
+  state.restoreAll();
+
+  assert.equal(state.hiddenCount, 0);
+  assert.equal(state.deletedCount, 0);
+  assert.equal(state.lockedCount, 1);
+
+  state.unlockAll();
+  assert.equal(state.lockedCount, 0);
+});

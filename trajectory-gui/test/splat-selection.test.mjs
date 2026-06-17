@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { findNearestProjectedCenter, projectPointToScreen } from "../src/features/splat-editor/playcanvas/selection.mjs";
+import { findNearestProjectedCenter, findProjectedCentersInRect, projectPointToScreen } from "../src/features/splat-editor/playcanvas/selection.mjs";
 
 test("projectPointToScreen maps clip-space center to viewport center", () => {
   const projected = projectPointToScreen([0, 0, 0], identityMatrix(), { width: 800, height: 600 });
@@ -34,6 +34,13 @@ test("findNearestProjectedCenter returns null when no projected center is inside
   const match = findNearestProjectedCenter(centers, identityMatrix(), { width: 800, height: 600 }, { x: 50, y: 50 }, 10);
 
   assert.equal(match, null);
+});
+
+test("findProjectedCentersInRect returns every center inside a screen rectangle", () => {
+  const centers = new Float32Array([-0.5, 0, 0, 0.25, 0, 0, 0.9, 0, 0]);
+  const indices = findProjectedCentersInRect(centers, identityMatrix(), { width: 800, height: 600 }, { x1: 350, y1: 250, x2: 780, y2: 350 });
+
+  assert.deepEqual(indices, [1, 2]);
 });
 
 function identityMatrix() {
