@@ -107,7 +107,7 @@ export function TrajectoryCanvas({
         <ambientLight intensity={0.7} />
         <directionalLight position={[4, 5, 3]} intensity={1.2} />
         <DisplayGrid mode={displayAxisMode} />
-        <axesHelper args={[1.2]} />
+        <AxisGuide mode={displayAxisMode} yDirection={displayYDirection} />
         <AxisLabels mode={displayAxisMode} yDirection={displayYDirection} />
         <PathPlannerScene
           draft={pathPlanner}
@@ -181,7 +181,8 @@ function FixedProjectionCamera({ projection }: { projection: PathPlannerDraft["p
       camera.position.set(7, 0, 0);
       camera.up.set(0, 1, 0);
     } else {
-      camera.position.set(0, -7, 0);
+      // X-Z plane view from +Y keeps Z vertical while matching the left-handed screen orientation.
+      camera.position.set(0, 7, 0);
       camera.up.set(0, 0, 1);
     }
     camera.lookAt(0, 0, 0);
@@ -616,6 +617,18 @@ function SyncedVideoFrame({
 
 function DisplayGrid({ mode }: { mode: "y-up" | "z-up" }) {
   return <gridHelper args={[6, 24, "#303746", "#202632"]} rotation={mode === "z-up" ? [Math.PI / 2, 0, 0] : [0, 0, 0]} />;
+}
+
+function AxisGuide({ mode, yDirection }: { mode: "y-up" | "z-up"; yDirection: "positive-up" | "positive-down" }) {
+  const origin = new THREE.Vector3(0, 0, 0);
+  const yAxis = mode === "z-up" ? [0, 0, yDirection === "positive-down" ? -1 : 1] : [0, yDirection === "positive-down" ? -1 : 1, 0];
+  return (
+    <>
+      <arrowHelper args={[new THREE.Vector3(1, 0, 0), origin, 1.2, "#ff6b6b", 0.16, 0.08]} />
+      <arrowHelper args={[new THREE.Vector3(yAxis[0], yAxis[1], yAxis[2]), origin, 1.2, "#59d98e", 0.16, 0.08]} />
+      <arrowHelper args={[new THREE.Vector3(0, 0, 1), origin, 1.2, "#66a3ff", 0.16, 0.08]} />
+    </>
+  );
 }
 
 function AxisLabels({ mode, yDirection }: { mode: "y-up" | "z-up"; yDirection: "positive-up" | "positive-down" }) {
