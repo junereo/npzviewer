@@ -102,3 +102,20 @@ export type TransformDraft = {
   translate: [number, number, number];
   rotateEulerDeg: [number, number, number];
 };
+
+export type PathPlannerDraft = {
+  fps: number;
+  durationSec: number;
+  frameCount: number;
+  start: [number, number, number];
+  end: [number, number, number];
+  anchors: [number, number, number][];
+  clickCreateMode: boolean;
+  projection: "xz" | "zy";
+  yawDeg: number;
+  pitchDeg: number;
+  povMode: "follow-path" | "manual";
+  easing: "linear" | "smoothstep";
+  expectedMeters: number;
+  observedMeters: number;
+};

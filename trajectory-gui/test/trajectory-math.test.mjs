@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { cameraCenterFromW2c, applyTrajectoryTransform, alignOverlayFrames, applyAxisRemap, fovFromIntrinsics, cameraAxesFromW2c, cameraYawPitchFromW2c, describeDirection, forwardFromYawPitch, toDisplayVec3, yawPitchFromForward } from "../src/features/trajectory/math.mjs";
+import { cameraCenterFromW2c, applyTrajectoryTransform, alignOverlayFrames, applyAxisRemap, fovFromIntrinsics, cameraAxesFromW2c, cameraYawPitchFromW2c, describeDirection, forwardFromYawPitch, generatePathFrames, normalizePathDistance, pathLengthMeters, toDisplayVec3, yawPitchFromForward } from "../src/features/trajectory/math.mjs";
 
 test("cameraCenterFromW2c returns -R^T t", () => {
   const w2c = [
@@ -179,6 +179,41 @@ test("toDisplayVec3 maps Y-up data into Z-up display coordinates", () => {
   assert.deepEqual(toDisplayVec3([1, 2, 3], "z-up"), [1, -3, 2]);
 });
 
+test("generatePathFrames creates an 81 sample trajectory for an 80 frame interval", () => {
+  const frames = generatePathFrames(defaultPathDraft(), defaultIntrinsics());
+
+  assert.equal(frames.length, 81);
+  assert.deepEqual(frames[0].center, [0, 0, 0]);
+  assert.deepEqual(frames[80].center, [0, 0, 3]);
+  assert.equal(pathLengthMeters(frames[0].center, frames[80].center), 3);
+  assert.deepEqual(cameraCenterFromW2c(frames[80].w2c), [0, 0, 3]);
+  assert.deepEqual(cameraAxesFromW2c(frames[0].w2c, "plus-z").forward, [0, 0, 1]);
+});
+
+test("generatePathFrames keeps +Y as downward movement in meter coordinates", () => {
+  const draft = { ...defaultPathDraft(), end: [0, 1.2, 3] };
+  const frames = generatePathFrames(draft, defaultIntrinsics());
+
+  assert.deepEqual(frames[80].center, [0, 1.2, 3]);
+});
+
+test("generatePathFrames supports manual yaw pitch POV", () => {
+  const draft = { ...defaultPathDraft(), povMode: "manual", yawDeg: 90, pitchDeg: 0 };
+  const frames = generatePathFrames(draft, defaultIntrinsics());
+  const axes = cameraAxesFromW2c(frames[0].w2c, "plus-z");
+
+  assert.equal(Math.round(axes.forward[0]), 1);
+  assert.equal(Math.round(axes.forward[2]), 0);
+});
+
+test("normalizePathDistance scales endpoint to the requested meter length", () => {
+  const draft = { ...defaultPathDraft(), end: [0, 0, 6] };
+  const normalized = normalizePathDistance(draft, 3);
+
+  assert.deepEqual(normalized.end, [0, 0, 3]);
+  assert.equal(normalized.expectedMeters, 3);
+});
+
 function identityW2c() {
   return [
     [1, 0, 0, 0],
@@ -186,4 +221,29 @@ function identityW2c() {
     [0, 0, 1, 0],
     [0, 0, 0, 1],
   ];
+}
+
+function defaultIntrinsics() {
+  return [
+    [800, 0, 640],
+    [0, 800, 360],
+    [0, 0, 1],
+  ];
+}
+
+function defaultPathDraft() {
+  return {
+    fps: 16,
+    durationSec: 5,
+    frameCount: 80,
+    start: [0, 0, 0],
+    end: [0, 0, 3],
+    projection: "xz",
+    yawDeg: 0,
+    pitchDeg: 0,
+    povMode: "follow-path",
+    easing: "linear",
+    expectedMeters: 3,
+    observedMeters: 3,
+  };
 }

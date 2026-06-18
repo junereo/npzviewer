@@ -39,6 +39,70 @@ export function applyTrajectoryTransform(frames, transform) {
   });
 }
 
+export function pathLengthMeters(start, end) {
+  return cleanNumber(Math.hypot(end[0] - start[0], end[1] - start[1], end[2] - start[2]));
+}
+
+export function normalizePathDistance(draft, targetMeters) {
+  const distance = pathLengthMeters(draft.start, draft.end);
+  if (!(distance > 1e-8) || !(targetMeters > 0)) {
+    return draft;
+  }
+  const direction = scaleVec3(subVec3(draft.end, draft.start), 1 / distance);
+  return {
+    ...draft,
+    end: addVec3(draft.start, scaleVec3(direction, targetMeters)).map(cleanNumber),
+    expectedMeters: cleanNumber(targetMeters),
+  };
+}
+
+export function generatePathFrames(draft, intrinsics) {
+  const frameCount = Math.max(2, Math.round(draft.frameCount || 80) + 1);
+  const baseForward = pathLengthMeters(draft.start, draft.end) > 1e-8 ? normalizeVec3(subVec3(draft.end, draft.start)) : [0, 0, 1];
+  const manualForward = forwardFromYawPitch(draft.yawDeg || 0, draft.pitchDeg || 0);
+  const forward = draft.povMode === "manual" ? manualForward : baseForward;
+  const frames = [];
+
+  for (let index = 0; index < frameCount; index += 1) {
+    const rawT = frameCount === 1 ? 0 : index / (frameCount - 1);
+    const t = draft.easing === "smoothstep" ? rawT * rawT * (3 - 2 * rawT) : rawT;
+    const center = [
+      lerp(draft.start[0], draft.end[0], t),
+      lerp(draft.start[1], draft.end[1], t),
+      lerp(draft.start[2], draft.end[2], t),
+    ].map(cleanNumber);
+    const K = cloneMatrix(intrinsics);
+    frames.push({
+      index,
+      w2c: w2cFromCenterForward(center, forward),
+      intrinsics: K,
+      center,
+      focal: { fx: K[0][0], fy: K[1][1], cx: K[0][2], cy: K[1][2] },
+    });
+  }
+
+  return frames;
+}
+
+export function w2cFromCenterForward(center, forward) {
+  const zAxis = normalizeVec3(forward);
+  const worldDown = Math.abs(dotVec3(zAxis, [0, 1, 0])) > 0.98 ? [1, 0, 0] : [0, 1, 0];
+  const xAxis = normalizeVec3(crossVec3(worldDown, zAxis));
+  const yAxis = normalizeVec3(crossVec3(zAxis, xAxis));
+  const rotation = [
+    [xAxis[0], yAxis[0], zAxis[0]],
+    [xAxis[1], yAxis[1], zAxis[1]],
+    [xAxis[2], yAxis[2], zAxis[2]],
+  ];
+  const t = mulMat3Vec3(rotation, scaleVec3(center, -1));
+  return [
+    [cleanNumber(rotation[0][0]), cleanNumber(rotation[0][1]), cleanNumber(rotation[0][2]), cleanNumber(t[0])],
+    [cleanNumber(rotation[1][0]), cleanNumber(rotation[1][1]), cleanNumber(rotation[1][2]), cleanNumber(t[1])],
+    [cleanNumber(rotation[2][0]), cleanNumber(rotation[2][1]), cleanNumber(rotation[2][2]), cleanNumber(t[2])],
+    [0, 0, 0, 1],
+  ];
+}
+
 export function alignOverlayFrames(overlayFrames, trajectoryFrames, mode, axisRemap = "none") {
   const remappedFrames = applyAxisRemap(overlayFrames, axisRemap);
   if (mode === "raw" || !overlayFrames.length || !trajectoryFrames.length) {
@@ -299,6 +363,10 @@ function addVec3(left, right) {
 
 function subVec3(left, right) {
   return [left[0] - right[0], left[1] - right[1], left[2] - right[2]];
+}
+
+function lerp(start, end, t) {
+  return start + (end - start) * t;
 }
 
 function dotVec3(left, right) {

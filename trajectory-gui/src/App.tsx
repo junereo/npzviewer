@@ -4,9 +4,9 @@ import { cleanPly, exportTrajectory, inspectCameras, inspectTrajectory, inspectV
 import { convertPlyViewerAsset } from "./features/trajectory/api";
 import { GaussianViewer } from "./features/ply-viewer/GaussianViewer";
 import { TrajectoryCanvas } from "./features/trajectory/components/TrajectoryCanvas";
-import { cameraAxesFromW2c, cameraYawPitchFromW2c, describeDirection, fovFromIntrinsics } from "./features/trajectory/math.mjs";
+import { cameraAxesFromW2c, cameraYawPitchFromW2c, describeDirection, fovFromIntrinsics, pathLengthMeters } from "./features/trajectory/math.mjs";
 import { useTrajectoryStore } from "./features/trajectory/store";
-import type { CameraFrame, DepthFrameStats } from "./features/trajectory/types";
+import type { CameraFrame, CamerasDocument, DepthFrameStats, PathPlannerDraft, TrajectoryDocument } from "./features/trajectory/types";
 import type { PlyCleanOptions, PlyCleanPreset, PlyCleanStats, PlyProgressEvent } from "./features/trajectory/api";
 import type { ViewerJob } from "./features/ply-viewer/types";
 
@@ -26,6 +26,9 @@ export function App() {
     displayYDirection,
     selectedFrame,
     selectFrame,
+    pathPlanner,
+    pathUndoStack,
+    pathRedoStack,
     setDocument,
     setCameras,
     setVipe,
@@ -38,7 +41,18 @@ export function App() {
     setDisplayYDirection,
     transform,
     setTransform,
+    setPathPlanner,
+    resetPathPlanner,
+    normalizePathPlannerDistance,
     applyTransform,
+    applyPathPlanner,
+    appendPathPlannerSegment,
+    addPathPlannerPoint,
+    checkpointPathPlannerHistory,
+    finishPathPlanner,
+    undoPathPlanner,
+    redoPathPlanner,
+    updatePathPlannerAnchor,
     cropFrames,
     updateIntrinsics,
   } =
@@ -60,6 +74,12 @@ export function App() {
   const selectedAxes = selected ? cameraAxesFromW2c(selected.w2c, trajectoryForwardConvention) : null;
   const selectedYawPitch = selected ? cameraYawPitchFromW2c(selected.w2c, trajectoryForwardConvention) : null;
   const forwardDescription = selectedAxes ? describeDirection(selectedAxes.forward) : null;
+  const pathDistanceMeters = useMemo(() => pathLengthMeters(pathPlanner.start, pathPlanner.end), [pathPlanner.start, pathPlanner.end]);
+  const recommendedPoseScale = pathPlanner.observedMeters > 0 ? pathPlanner.expectedMeters / pathPlanner.observedMeters : null;
+  const pathSegmentCount = Math.max(0, pathPlanner.anchors.length - 1);
+  const pathTotalFrames = pathSegmentCount > 0 ? pathSegmentCount * pathPlanner.frameCount + 1 : 0;
+  const scaleAnalysisRows = useMemo(() => buildScaleAnalysisRows(document, cameras), [document, cameras]);
+  const preferredScaleAnalysis = scaleAnalysisRows[0] ?? null;
   const recommendedFrames = useMemo(() => [81, 161, 241, 321, 401, 481], []);
   const fps = vipe?.fps?.[0] ?? cameras?.metadata.fps?.[0] ?? 16;
   const playbackMinFrame = useMemo(() => {
@@ -166,6 +186,16 @@ export function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function updatePathPlanner(patch: Partial<PathPlannerDraft>) {
+    setPathPlanner({ ...pathPlanner, ...patch });
+  }
+
+  function updatePathPoint(point: "start" | "end", axis: 0 | 1 | 2, value: number) {
+    const next = [...pathPlanner[point]] as [number, number, number];
+    next[axis] = value;
+    setPathPlanner({ ...pathPlanner, [point]: next });
   }
 
   function applyLyraCameraToTrajectoryPreset() {
@@ -455,7 +485,12 @@ export function App() {
             playbackFrame={playbackFrame}
             vipe={vipe}
             videoElement={videoElement}
+            pathPlanner={pathPlanner}
             onSelectFrame={selectFrame}
+            onPathPlannerChange={setPathPlanner}
+            onPathPlannerPointAdd={addPathPlannerPoint}
+            onPathPlannerAnchorEditStart={checkpointPathPlannerHistory}
+            onPathPlannerAnchorChange={updatePathPlannerAnchor}
           />
           {document ? (
             <input
@@ -547,6 +582,165 @@ export function App() {
 
         <aside className="panel right-panel">
           <h2>Edit</h2>
+          <section className="editor-section path-planner">
+            <h3>새 trajectory 만들기</h3>
+            <div className="path-primary-actions">
+              <button className={pathPlanner.clickCreateMode ? "button primary full active" : "button primary full"} onClick={applyPathPlanner}>
+                <Wand2 size={16} />
+                {pathPlanner.clickCreateMode ? "중앙 GUI 클릭으로 80프레임 추가 중" : "새 trajectory 생성 / 적용"}
+              </button>
+              {pathPlanner.clickCreateMode ? (
+                <button className="button full" onClick={finishPathPlanner}>
+                  완료
+                </button>
+              ) : null}
+              <button className="button ghost full" onClick={appendPathPlannerSegment}>
+                +80프레임 이어붙이기
+              </button>
+            </div>
+            <div className="path-history-actions">
+              <button className="button ghost" disabled={!pathUndoStack.length} onClick={undoPathPlanner}>
+                Undo
+              </button>
+              <button className="button ghost" disabled={!pathRedoStack.length} onClick={redoPathPlanner}>
+                Redo
+              </button>
+              <button className="button primary" disabled={!document || busy} onClick={() => void onExport()}>
+                <Download size={16} />
+                최종 NPZ 내보내기
+              </button>
+            </div>
+            <div className="path-notice">
+              <strong>왼손 좌표계 / 1 scene unit = 1m</strong>
+              <span>+Z 앞으로, -Z 뒤로, +X 오른쪽, -X 왼쪽, +Y 아래, -Y 위</span>
+              <span>NPZ를 열지 않아도 중앙 좌표 평면에서 경로를 만들고 바로 내보낼 수 있습니다.</span>
+              <span>Lyra 결과 이동량이 다르면 실행 시 --pose_scale로 보정하세요.</span>
+            </div>
+            <div className="path-planner-actions">
+              <button className="button ghost" onClick={() => normalizePathPlannerDistance(3)}>
+                3.0m로 맞추기
+              </button>
+              <button className="button ghost" onClick={resetPathPlanner}>
+                입력 초기화
+              </button>
+            </div>
+            <div className="path-readout">
+              <span>중앙 캔버스의 X-Z 평면에서 시작점과 끝점을 직접 드래그하세요.</span>
+              <span>
+                세그먼트 {pathSegmentCount}개 / 총 {pathTotalFrames}프레임
+              </span>
+              <span>클릭 1회 = +{pathPlanner.frameCount}프레임 간격 / 끝 기점 +1</span>
+              <strong>현재 거리 {pathDistanceMeters.toFixed(3)}m</strong>
+            </div>
+            <div className="coordinate-grid path-points-grid">
+              {(["X", "Y", "Z"] as const).map((axis, index) => (
+                <NumberField
+                  key={`start-${axis}`}
+                  label={`시작 ${axis} (m)`}
+                  value={pathPlanner.start[index]}
+                  onChange={(value) => updatePathPoint("start", index as 0 | 1 | 2, value)}
+                />
+              ))}
+              {(["X", "Y", "Z"] as const).map((axis, index) => (
+                <NumberField
+                  key={`end-${axis}`}
+                  label={`끝 ${axis} (m)`}
+                  value={pathPlanner.end[index]}
+                  onChange={(value) => updatePathPoint("end", index as 0 | 1 | 2, value)}
+                />
+              ))}
+            </div>
+            <div className="path-mode-row">
+              <button
+                className={pathPlanner.povMode === "follow-path" ? "chip active" : "chip"}
+                onClick={() => updatePathPlanner({ povMode: "follow-path" })}
+              >
+                진행 방향 보기
+              </button>
+              <button
+                className={pathPlanner.povMode === "manual" ? "chip active" : "chip"}
+                onClick={() => updatePathPlanner({ povMode: "manual" })}
+              >
+                POV 수동 설정
+              </button>
+            </div>
+            <div className="coordinate-grid path-camera-grid">
+              <NumberField label="Yaw (도)" value={pathPlanner.yawDeg} onChange={(yawDeg) => updatePathPlanner({ yawDeg, povMode: "manual" })} />
+              <NumberField label="Pitch (도)" value={pathPlanner.pitchDeg} onChange={(pitchDeg) => updatePathPlanner({ pitchDeg, povMode: "manual" })} />
+              <label className="number-field">
+                <span>보간</span>
+                <select value={pathPlanner.easing} onChange={(event) => updatePathPlanner({ easing: event.target.value as PathPlannerDraft["easing"] })}>
+                  <option value="linear">linear</option>
+                  <option value="smoothstep">smoothstep</option>
+                </select>
+              </label>
+            </div>
+            <div className="pose-scale-helper">
+              <strong>--pose_scale 계산</strong>
+              <span>Lyra는 첫 프레임 monocular depth 기준으로 경로를 해석하므로 실제 이동량이 달라질 수 있습니다.</span>
+              <div className="coordinate-grid path-scale-grid">
+                <NumberField label="GUI 예상 거리 (m)" value={pathPlanner.expectedMeters} onChange={(expectedMeters) => updatePathPlanner({ expectedMeters })} />
+                <NumberField label="Lyra 결과 거리 (m)" value={pathPlanner.observedMeters} onChange={(observedMeters) => updatePathPlanner({ observedMeters })} />
+              </div>
+              <span>
+                추천값: {recommendedPoseScale && Number.isFinite(recommendedPoseScale) ? `--pose_scale ${recommendedPoseScale.toFixed(3)}` : "결과 거리를 입력하세요"}
+              </span>
+            </div>
+            <div className="scale-analysis-card">
+              <strong>Camera 0→80 scale 분석</strong>
+              {preferredScaleAnalysis ? (
+                <>
+                  <span>
+                    기준 세트 {preferredScaleAnalysis.label}: camera {preferredScaleAnalysis.cameraEndToEnd.toFixed(3)} / trajectory{" "}
+                    {preferredScaleAnalysis.trajectoryEndToEnd.toFixed(3)}
+                  </span>
+                  <span>
+                    trajectory를 camera 크기에 맞추는 Scale = {preferredScaleAnalysis.trajectoryToCameraScale.toFixed(6)}
+                  </span>
+                  <span>--pose_scale 후보 trajectory → camera = {preferredScaleAnalysis.trajectoryToCameraScale.toFixed(6)}</span>
+                  <span>역방향 camera → trajectory = {preferredScaleAnalysis.poseScale.toFixed(6)}</span>
+                  <div className="scale-analysis-actions">
+                    <button
+                      className="button"
+                      onClick={() => setTransform({ ...transform, scale: preferredScaleAnalysis.trajectoryToCameraScale })}
+                    >
+                      Transform Scale에 적용
+                    </button>
+                    <button
+                      className="button ghost"
+                      onClick={() =>
+                        setPathPlanner({
+                          ...pathPlanner,
+                          expectedMeters: preferredScaleAnalysis.cameraEndToEnd,
+                          observedMeters: preferredScaleAnalysis.trajectoryEndToEnd,
+                        })
+                      }
+                    >
+                      pose_scale 계산에 적용
+                    </button>
+                  </div>
+                  {scaleAnalysisRows.length > 1 ? (
+                    <div className="scale-analysis-table">
+                      {scaleAnalysisRows.map((row) => (
+                        <button
+                          key={row.key}
+                          className="scale-analysis-row"
+                          onClick={() => setTransform({ ...transform, scale: row.trajectoryToCameraScale })}
+                          title="이 camera set의 scale을 Transform Scale에 적용"
+                        >
+                          <span>{row.label}</span>
+                          <strong>{row.trajectoryToCameraScale.toFixed(3)}x</strong>
+                          <small>{row.cameraEndToEnd.toFixed(2)} / {row.trajectoryEndToEnd.toFixed(2)}</small>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <span>trajectory.npz와 cameras.npz를 모두 열면 0→80 프레임 기준 scale을 자동 계산합니다.</span>
+              )}
+            </div>
+          </section>
           {selected ? (
             <>
               <section className="editor-section">
@@ -582,6 +776,86 @@ export function App() {
                 ) : null}
               </section>
 
+              <section className="editor-section path-planner">
+                <h3>경로 생성</h3>
+                <div className="path-notice">
+                  <strong>단위 규칙: 1 scene unit = 1m</strong>
+                  <span>+Z 앞으로, -Z 뒤로, +X 오른쪽, -X 왼쪽, +Y 아래, -Y 위</span>
+                  <span>Lyra 결과 이동량이 다르면 실행 시 --pose_scale로 보정하세요.</span>
+                </div>
+                <div className="path-planner-actions">
+                  <button className="button" onClick={resetPathPlanner}>
+                    새 80프레임 경로
+                  </button>
+                  <button className="button ghost" onClick={() => normalizePathPlannerDistance(3)}>
+                    3.0m로 맞추기
+                  </button>
+                </div>
+                <PathPlaneEditor draft={pathPlanner} onChange={setPathPlanner} />
+                <div className="path-readout">
+                  <span>프레임 {pathPlanner.frameCount}개 / {pathPlanner.fps}FPS / {pathPlanner.durationSec.toFixed(1)}초</span>
+                  <strong>현재 거리 {pathDistanceMeters.toFixed(3)}m</strong>
+                </div>
+                <div className="coordinate-grid">
+                  {(["X", "Y", "Z"] as const).map((axis, index) => (
+                    <NumberField
+                      key={`start-${axis}`}
+                      label={`시작 ${axis} (m)`}
+                      value={pathPlanner.start[index]}
+                      onChange={(value) => updatePathPoint("start", index as 0 | 1 | 2, value)}
+                    />
+                  ))}
+                  {(["X", "Y", "Z"] as const).map((axis, index) => (
+                    <NumberField
+                      key={`end-${axis}`}
+                      label={`끝 ${axis} (m)`}
+                      value={pathPlanner.end[index]}
+                      onChange={(value) => updatePathPoint("end", index as 0 | 1 | 2, value)}
+                    />
+                  ))}
+                </div>
+                <div className="path-mode-row">
+                  <button
+                    className={pathPlanner.povMode === "follow-path" ? "chip active" : "chip"}
+                    onClick={() => updatePathPlanner({ povMode: "follow-path" })}
+                  >
+                    진행 방향 보기
+                  </button>
+                  <button
+                    className={pathPlanner.povMode === "manual" ? "chip active" : "chip"}
+                    onClick={() => updatePathPlanner({ povMode: "manual" })}
+                  >
+                    POV 수동 설정
+                  </button>
+                </div>
+                <div className="coordinate-grid">
+                  <NumberField label="Yaw (도)" value={pathPlanner.yawDeg} onChange={(yawDeg) => updatePathPlanner({ yawDeg, povMode: "manual" })} />
+                  <NumberField label="Pitch (도)" value={pathPlanner.pitchDeg} onChange={(pitchDeg) => updatePathPlanner({ pitchDeg, povMode: "manual" })} />
+                  <label className="number-field">
+                    <span>보간</span>
+                    <select value={pathPlanner.easing} onChange={(event) => updatePathPlanner({ easing: event.target.value as PathPlannerDraft["easing"] })}>
+                      <option value="linear">linear</option>
+                      <option value="smoothstep">smoothstep</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="pose-scale-helper">
+                  <strong>--pose_scale 계산</strong>
+                  <span>Lyra는 첫 프레임 monocular depth 기준으로 경로를 해석하므로 실제 이동량이 달라질 수 있습니다.</span>
+                  <div className="coordinate-grid">
+                    <NumberField label="GUI 예상 거리 (m)" value={pathPlanner.expectedMeters} onChange={(expectedMeters) => updatePathPlanner({ expectedMeters })} />
+                    <NumberField label="Lyra 결과 거리 (m)" value={pathPlanner.observedMeters} onChange={(observedMeters) => updatePathPlanner({ observedMeters })} />
+                  </div>
+                  <span>
+                    추천값: {recommendedPoseScale && Number.isFinite(recommendedPoseScale) ? `--pose_scale ${recommendedPoseScale.toFixed(3)}` : "결과 거리를 입력하세요"}
+                  </span>
+                </div>
+                <button className="button full" onClick={applyPathPlanner}>
+                  <Wand2 size={16} />
+                  경로를 trajectory에 적용
+                </button>
+              </section>
+
               <section className="editor-section">
                 <h3>Transform all</h3>
                 <NumberField
@@ -598,6 +872,18 @@ export function App() {
                       const translate = [...transform.translate] as [number, number, number];
                       translate[index] = value;
                       setTransform({ ...transform, translate });
+                    }}
+                  />
+                ))}
+                {(["Yaw", "Pitch", "Roll"] as const).map((axis, index) => (
+                  <NumberField
+                    key={`rotate-${axis}`}
+                    label={`Rotate ${axis}`}
+                    value={transform.rotateEulerDeg[index]}
+                    onChange={(value) => {
+                      const rotateEulerDeg = [...transform.rotateEulerDeg] as [number, number, number];
+                      rotateEulerDeg[index] = value;
+                      setTransform({ ...transform, rotateEulerDeg });
                     }}
                   />
                 ))}
@@ -1216,6 +1502,80 @@ function NumberField({ label, value, onChange }: { label: string; value: number;
   );
 }
 
+function PathPlaneEditor({ draft, onChange }: { draft: PathPlannerDraft; onChange: (draft: PathPlannerDraft) => void }) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [dragging, setDragging] = useState<"start" | "end" | null>(null);
+  const width = 240;
+  const height = 170;
+  const range = 4;
+
+  function toSvg(point: [number, number, number]) {
+    return {
+      x: ((clamp(point[0], -range, range) / (range * 2)) + 0.5) * width,
+      y: height - (((clamp(point[2], -range, range) / (range * 2)) + 0.5) * height),
+    };
+  }
+
+  function updatePoint(pointName: "start" | "end", event: React.PointerEvent<SVGSVGElement>) {
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const xRatio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+    const zRatio = clamp(1 - (event.clientY - rect.top) / rect.height, 0, 1);
+    const nextPoint = [...draft[pointName]] as [number, number, number];
+    nextPoint[0] = Number(((xRatio - 0.5) * range * 2).toFixed(3));
+    nextPoint[2] = Number(((zRatio - 0.5) * range * 2).toFixed(3));
+    onChange({ ...draft, [pointName]: nextPoint });
+  }
+
+  const start = toSvg(draft.start);
+  const end = toSvg(draft.end);
+
+  return (
+    <div className="path-plane-wrap">
+      <svg
+        ref={svgRef}
+        className="path-plane"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label="X-Z 평면 경로 편집기"
+        onPointerMove={(event) => dragging && updatePoint(dragging, event)}
+        onPointerUp={() => setDragging(null)}
+        onPointerLeave={() => setDragging(null)}
+      >
+        <rect x="0" y="0" width={width} height={height} rx="8" />
+        <line x1={width / 2} y1="0" x2={width / 2} y2={height} className="path-axis" />
+        <line x1="0" y1={height / 2} x2={width} y2={height / 2} className="path-axis" />
+        <text x={width - 34} y={height / 2 - 8}>+X</text>
+        <text x={width / 2 + 8} y="18">+Z</text>
+        <line x1={start.x} y1={start.y} x2={end.x} y2={end.y} className="path-line" />
+        <circle
+          cx={start.x}
+          cy={start.y}
+          r="9"
+          className="path-point start"
+          onPointerDown={(event) => {
+            setDragging("start");
+            event.currentTarget.setPointerCapture(event.pointerId);
+          }}
+        />
+        <circle
+          cx={end.x}
+          cy={end.y}
+          r="9"
+          className="path-point end"
+          onPointerDown={(event) => {
+            setDragging("end");
+            event.currentTarget.setPointerCapture(event.pointerId);
+          }}
+        />
+        <text x={start.x + 12} y={start.y - 8}>시작</text>
+        <text x={end.x + 12} y={end.y - 8}>끝</text>
+      </svg>
+      <span>X-Z 평면에서 시작점과 끝점을 드래그하세요. Y 높이는 아래 숫자 입력으로 조정합니다.</span>
+    </div>
+  );
+}
+
 function buildFrameMatches(
   selectedFrame: number,
   cameras: ReturnType<typeof useTrajectoryStore.getState>["cameras"],
@@ -1254,6 +1614,62 @@ function buildFrameMatches(
   return rows;
 }
 
+type ScaleAnalysisRow = {
+  key: string;
+  label: string;
+  trajectoryEndToEnd: number;
+  trajectoryCumulative: number;
+  cameraEndToEnd: number;
+  cameraCumulative: number;
+  trajectoryToCameraScale: number;
+  poseScale: number;
+};
+
+function buildScaleAnalysisRows(document: TrajectoryDocument | null, cameras: CamerasDocument | null): ScaleAnalysisRow[] {
+  if (!document?.frames.length || !cameras?.sets.length) return [];
+  const trajectoryDistance = distanceForFirst80(document.frames);
+  if (!(trajectoryDistance.endToEnd > 1e-8)) return [];
+
+  return cameras.sets
+    .map((set) => {
+      const cameraDistance = distanceForFirst80(set.frames);
+      if (!(cameraDistance.endToEnd > 1e-8)) return null;
+      return {
+        key: set.key,
+        label: set.label || set.key,
+        trajectoryEndToEnd: trajectoryDistance.endToEnd,
+        trajectoryCumulative: trajectoryDistance.cumulative,
+        cameraEndToEnd: cameraDistance.endToEnd,
+        cameraCumulative: cameraDistance.cumulative,
+        trajectoryToCameraScale: cameraDistance.endToEnd / trajectoryDistance.endToEnd,
+        poseScale: trajectoryDistance.endToEnd / cameraDistance.endToEnd,
+      } satisfies ScaleAnalysisRow;
+    })
+    .filter((row): row is ScaleAnalysisRow => Boolean(row))
+    .sort((left, right) => cameraSetPriority(left.key) - cameraSetPriority(right.key));
+}
+
+function distanceForFirst80(frames: Array<{ center: [number, number, number] }>) {
+  const endIndex = Math.min(80, frames.length - 1);
+  let cumulative = 0;
+  for (let index = 1; index <= endIndex; index += 1) {
+    cumulative += pathLengthMeters(frames[index - 1].center, frames[index].center);
+  }
+  return {
+    endIndex,
+    cumulative,
+    endToEnd: pathLengthMeters(frames[0].center, frames[endIndex].center),
+  };
+}
+
+function cameraSetPriority(key: string) {
+  const normalized = key.toLowerCase();
+  if (normalized.includes("render")) return 0;
+  if (normalized.includes("vipe")) return 1;
+  if (normalized.includes("da3")) return 2;
+  return 10;
+}
+
 function nearestDepthFrame(frames: DepthFrameStats[], sourceFrame: number): DepthFrameStats | null {
   return nearestSourceFrame(frames, sourceFrame);
 }
@@ -1270,6 +1686,10 @@ function nearestSourceFrame<T extends { sourceFrameIndex?: number; index: number
     }
   }
   return best;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function formatOptionalNumber(value: number | null | undefined): string {

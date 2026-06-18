@@ -1,7 +1,11 @@
-import type { CameraFrame, CameraOverlayFrame, Matrix4, TransformDraft } from "./types";
+import type { CameraFrame, CameraOverlayFrame, Matrix3, Matrix4, PathPlannerDraft, TransformDraft } from "./types";
 
 export function cameraCenterFromW2c(w2c: Matrix4): [number, number, number];
 export function applyTrajectoryTransform(frames: CameraFrame[], transform: TransformDraft): CameraFrame[];
+export function pathLengthMeters(start: [number, number, number], end: [number, number, number]): number;
+export function normalizePathDistance<T extends { start: [number, number, number]; end: [number, number, number] }>(draft: T, targetMeters: number): T;
+export function generatePathFrames(draft: PathPlannerDraft, intrinsics: Matrix3): CameraFrame[];
+export function w2cFromCenterForward(center: [number, number, number], forward: [number, number, number]): Matrix4;
 export function alignOverlayFrames(
   overlayFrames: CameraOverlayFrame[],
   trajectoryFrames: CameraFrame[],
