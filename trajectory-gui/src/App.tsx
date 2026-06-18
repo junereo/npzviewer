@@ -4,13 +4,22 @@ import { cleanPly, exportTrajectory, inspectCameras, inspectTrajectory, inspectV
 import { convertPlyViewerAsset } from "./features/trajectory/api";
 import { GaussianViewer } from "./features/ply-viewer/GaussianViewer";
 import { TrajectoryCanvas } from "./features/trajectory/components/TrajectoryCanvas";
-import { cameraAxesFromW2c, cameraYawPitchFromW2c, describeDirection, fovFromIntrinsics, pathLengthMeters } from "./features/trajectory/math.mjs";
+import {
+  cameraAxesFromW2c,
+  cameraYawPitchFromW2c,
+  describeDirection,
+  forwardFromYawPitch,
+  fovFromIntrinsics,
+  pathLengthMeters,
+  yawPitchFromForward,
+} from "./features/trajectory/math.mjs";
 import { useTrajectoryStore } from "./features/trajectory/store";
 import type { CameraFrame, CamerasDocument, DepthFrameStats, PathPlannerDraft, TrajectoryDocument } from "./features/trajectory/types";
 import type { PlyCleanOptions, PlyCleanPreset, PlyCleanStats, PlyProgressEvent } from "./features/trajectory/api";
 import type { ViewerJob } from "./features/ply-viewer/types";
 
 const SplatEditorApp = lazy(() => import("./features/splat-editor/SplatEditorApp").then((module) => ({ default: module.SplatEditorApp })));
+const LYRA_DEFAULT_POSE_SCALE = 1.1;
 
 export function App() {
   const {
@@ -53,8 +62,12 @@ export function App() {
     undoPathPlanner,
     redoPathPlanner,
     updatePathPlannerAnchor,
+    updatePathPlannerLookTarget,
+    updateFrameCenter,
+    updateFrameForward,
     cropFrames,
     updateIntrinsics,
+    updateResolution,
   } =
     useTrajectoryStore();
   const [busy, setBusy] = useState(false);
@@ -74,10 +87,15 @@ export function App() {
   const selectedAxes = selected ? cameraAxesFromW2c(selected.w2c, trajectoryForwardConvention) : null;
   const selectedYawPitch = selected ? cameraYawPitchFromW2c(selected.w2c, trajectoryForwardConvention) : null;
   const forwardDescription = selectedAxes ? describeDirection(selectedAxes.forward) : null;
+  const trajectoryLength = useMemo(() => (document ? trajectoryPathStats(document.frames) : null), [document]);
   const pathDistanceMeters = useMemo(() => pathLengthMeters(pathPlanner.start, pathPlanner.end), [pathPlanner.start, pathPlanner.end]);
+  const pathPlannerLength = useMemo(() => pathPlannerPathStats(pathPlanner), [pathPlanner]);
   const recommendedPoseScale = pathPlanner.observedMeters > 0 ? pathPlanner.expectedMeters / pathPlanner.observedMeters : null;
   const pathSegmentCount = Math.max(0, pathPlanner.anchors.length - 1);
   const pathTotalFrames = pathSegmentCount > 0 ? pathSegmentCount * pathPlanner.frameCount + 1 : 0;
+  const selectedPathAnchorIndex = clampIndex(pathPlanner.selectedViewAnchor, Math.max(1, pathPlanner.anchors.length || 2));
+  const selectedPathFrameLabel = selectedPathAnchorIndex === 0 ? "0F" : `${selectedPathAnchorIndex * pathPlanner.frameCount + 1}F`;
+  const pathViewWarnings = useMemo(() => buildPathViewWarnings(pathPlanner), [pathPlanner]);
   const scaleAnalysisRows = useMemo(() => buildScaleAnalysisRows(document, cameras), [document, cameras]);
   const preferredScaleAnalysis = scaleAnalysisRows[0] ?? null;
   const recommendedFrames = useMemo(() => [81, 161, 241, 321, 401, 481], []);
@@ -192,6 +210,16 @@ export function App() {
     setPathPlanner({ ...pathPlanner, ...patch });
   }
 
+  function updatePathPlannerViewTarget(anchorIndex: number, target: [number, number, number]) {
+    const selectedFrameData = document?.frames[selectedFrame];
+    if (selectedFrameData) {
+      const forward = normalizeVector(subtractVector(target, selectedFrameData.center));
+      updateFrameForward(selectedFrameData.index, forward);
+      return;
+    }
+    updatePathPlannerLookTarget(anchorIndex, target);
+  }
+
   function updatePathPoint(point: "start" | "end", axis: 0 | 1 | 2, value: number) {
     const next = [...pathPlanner[point]] as [number, number, number];
     next[axis] = value;
@@ -202,6 +230,51 @@ export function App() {
     setCameraAxisRemap({ x: false, y: true, z: true });
     setCameraAlignmentMode("raw");
   }
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      const key = event.key.toLowerCase();
+      const isFovKey = event.key === "ArrowUp" || event.key === "ArrowDown" || event.key === "ArrowLeft" || event.key === "ArrowRight";
+      const isMoveKey = key === "q" || key === "e";
+      const isIndexKey = key === "a" || key === "d";
+      if (!isFovKey && !isMoveKey && !isIndexKey) return;
+      const target = event.target as HTMLElement | null;
+      const tagName = target?.tagName.toLowerCase();
+      const inputType = target instanceof HTMLInputElement ? target.type : "";
+      if ((tagName === "input" && inputType !== "range") || tagName === "textarea" || tagName === "select" || target?.isContentEditable) return;
+      const selectedFrameData = document?.frames[selectedFrame];
+      event.preventDefault();
+      if (isIndexKey) {
+        const frameCount = document?.frames.length ?? 0;
+        if (!frameCount) return;
+        const nextFrame = clampIndex(selectedFrame + (key === "d" ? 1 : -1), frameCount);
+        selectFrame(nextFrame);
+        setPathPlanner({ ...pathPlanner, selectedViewAnchor: nearestAnchorIndexForFrame(nextFrame, pathPlanner) });
+        return;
+      }
+      if (!selectedFrameData) return;
+      if (!event.repeat) checkpointPathPlannerHistory();
+      if (isMoveKey) {
+        const delta = event.shiftKey ? 0.01 : 0.1;
+        const center = selectedFrameData.center;
+        const nextY = Number((center[1] + (key === "q" ? delta : -delta)).toFixed(3));
+        updateFrameCenter(selectedFrameData.index, [center[0], nextY, center[2]]);
+        return;
+      }
+      const angleStep = event.shiftKey ? 1 : 5;
+      const currentForward = cameraAxesFromW2c(selectedFrameData.w2c, "plus-z").forward;
+      const currentPose = yawPitchFromForward(currentForward);
+      const nextPose = {
+        yawDeg: currentPose.yawDeg + (event.key === "ArrowRight" ? angleStep : event.key === "ArrowLeft" ? -angleStep : 0),
+        pitchDeg: currentPose.pitchDeg + (event.key === "ArrowDown" ? angleStep : event.key === "ArrowUp" ? -angleStep : 0),
+      };
+      const nextForward = forwardFromYawPitch(nextPose.yawDeg, nextPose.pitchDeg) as [number, number, number];
+      updateFrameForward(selectedFrameData.index, nextForward);
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [checkpointPathPlannerHistory, document, pathPlanner, selectFrame, selectedFrame, setPathPlanner, updateFrameCenter, updateFrameForward]);
 
   if (activeTool === "ply") {
     return <PlyCleanerApp onSwitchToTrajectory={() => setActiveTool("trajectory")} />;
@@ -306,6 +379,14 @@ export function App() {
                 <div>
                   <dt>Frames</dt>
                   <dd>{document.meta.frameCount}</dd>
+                </div>
+                <div>
+                  <dt>Length</dt>
+                  <dd>{trajectoryLength ? `${trajectoryLength.cumulative.toFixed(3)} m` : "n/a"}</dd>
+                </div>
+                <div>
+                  <dt>0→80 length</dt>
+                  <dd>{trajectoryLength ? `${trajectoryLength.first80Cumulative.toFixed(3)} m` : "n/a"}</dd>
                 </div>
                 <div>
                   <dt>Resolution</dt>
@@ -491,6 +572,7 @@ export function App() {
             onPathPlannerPointAdd={addPathPlannerPoint}
             onPathPlannerAnchorEditStart={checkpointPathPlannerHistory}
             onPathPlannerAnchorChange={updatePathPlannerAnchor}
+            onPathPlannerViewTargetChange={updatePathPlannerViewTarget}
           />
           {document ? (
             <input
@@ -624,13 +706,48 @@ export function App() {
                 입력 초기화
               </button>
             </div>
+            <div className="view-target-card">
+              <div>
+                <strong>시야 클릭 설정</strong>
+                <span>선택 기준점 {selectedPathFrameLabel}</span>
+              </div>
+              <button
+                className={pathPlanner.viewEditMode ? "button primary active" : "button ghost"}
+                onClick={() => updatePathPlanner({ viewEditMode: !pathPlanner.viewEditMode })}
+              >
+                {pathPlanner.viewEditMode ? "시야 클릭 설정 중" : "시야 클릭 설정"}
+              </button>
+              <span>캔버스의 기준점을 클릭해 선택하고, 평면에서 바라볼 지점을 클릭하세요.</span>
+              <span>방향키: 선택 기준점 FOV 방향 조정, A/D: 기준점 이동, Q/E: 실제 Y값 +/-, Shift: 미세 조정</span>
+              {pathViewWarnings.length ? (
+                <div className="view-warning">
+                  {pathViewWarnings.slice(0, 2).map((warning) => (
+                    <span key={`${warning.anchorIndex}-${warning.angleDeg}`}>
+                      {warning.frameLabel} 기준 시야 회전 {warning.angleDeg.toFixed(1)}도
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
             <div className="path-readout">
               <span>중앙 캔버스의 X-Z 평면에서 시작점과 끝점을 직접 드래그하세요.</span>
               <span>
                 세그먼트 {pathSegmentCount}개 / 총 {pathTotalFrames}프레임
               </span>
               <span>클릭 1회 = +{pathPlanner.frameCount}프레임 간격 / 끝 기점 +1</span>
-              <strong>현재 거리 {pathDistanceMeters.toFixed(3)}m</strong>
+              <strong>현재 80프레임 길이 {pathDistanceMeters.toFixed(3)}m</strong>
+              <strong>전체 trajectory 길이 {pathPlannerLength.cumulative.toFixed(3)}m</strong>
+            </div>
+            <div className="coordinate-grid path-camera-grid">
+              <NumberField label="영상 Width (px)" value={pathPlanner.imageWidth} onChange={(imageWidth) => updatePathPlanner({ imageWidth: Math.max(1, Math.round(imageWidth)) })} />
+              <NumberField label="영상 Height (px)" value={pathPlanner.imageHeight} onChange={(imageHeight) => updatePathPlanner({ imageHeight: Math.max(1, Math.round(imageHeight)) })} />
+              <NumberField label="fx" value={pathPlanner.fx} onChange={(fx) => updatePathPlanner({ fx })} />
+              <NumberField label="fy" value={pathPlanner.fy} onChange={(fy) => updatePathPlanner({ fy })} />
+              <NumberField label="px / cx" value={pathPlanner.imageWidth / 2} onChange={() => undefined} readOnly />
+              <NumberField label="py / cy" value={pathPlanner.imageHeight / 2} onChange={() => undefined} readOnly />
+            </div>
+            <div className="camera-analysis">
+              <span>해상도는 입력 영상의 image_width / image_height입니다. 새 trajectory 생성 시 px/cx=width/2, py/cy=height/2로 자동 계산됩니다.</span>
             </div>
             <div className="coordinate-grid path-points-grid">
               {(["X", "Y", "Z"] as const).map((axis, index) => (
@@ -678,6 +795,7 @@ export function App() {
             <div className="pose-scale-helper">
               <strong>--pose_scale 계산</strong>
               <span>Lyra는 첫 프레임 monocular depth 기준으로 경로를 해석하므로 실제 이동량이 달라질 수 있습니다.</span>
+              <span>Lyra custom trajectory 추론 기본값은 --pose_scale {LYRA_DEFAULT_POSE_SCALE.toFixed(1)}입니다.</span>
               <div className="coordinate-grid path-scale-grid">
                 <NumberField label="GUI 예상 거리 (m)" value={pathPlanner.expectedMeters} onChange={(expectedMeters) => updatePathPlanner({ expectedMeters })} />
                 <NumberField label="Lyra 결과 거리 (m)" value={pathPlanner.observedMeters} onChange={(observedMeters) => updatePathPlanner({ observedMeters })} />
@@ -842,6 +960,7 @@ export function App() {
                 <div className="pose-scale-helper">
                   <strong>--pose_scale 계산</strong>
                   <span>Lyra는 첫 프레임 monocular depth 기준으로 경로를 해석하므로 실제 이동량이 달라질 수 있습니다.</span>
+                  <span>Lyra custom trajectory 추론 기본값은 --pose_scale {LYRA_DEFAULT_POSE_SCALE.toFixed(1)}입니다.</span>
                   <div className="coordinate-grid">
                     <NumberField label="GUI 예상 거리 (m)" value={pathPlanner.expectedMeters} onChange={(expectedMeters) => updatePathPlanner({ expectedMeters })} />
                     <NumberField label="Lyra 결과 거리 (m)" value={pathPlanner.observedMeters} onChange={(observedMeters) => updatePathPlanner({ observedMeters })} />
@@ -909,7 +1028,14 @@ export function App() {
               </section>
 
               <section className="editor-section">
-                <h3>Intrinsics all frames</h3>
+                <h3>Input resolution / intrinsics</h3>
+                <div className="coordinate-grid">
+                  <NumberField label="Width (px)" value={document!.meta.imageWidth} onChange={(imageWidth) => updateResolution(imageWidth, document!.meta.imageHeight)} />
+                  <NumberField label="Height (px)" value={document!.meta.imageHeight} onChange={(imageHeight) => updateResolution(document!.meta.imageWidth, imageHeight)} />
+                </div>
+                <div className="camera-analysis">
+                  <span>해상도는 입력 영상의 image_width / image_height입니다. 변경하면 principal point cx/cy는 width/2, height/2로 다시 계산됩니다.</span>
+                </div>
                 <NumberField label="fx" value={selected.focal.fx} onChange={(fx) => updateIntrinsics(fx, selected.focal.fy, selected.focal.cx, selected.focal.cy)} />
                 <NumberField label="fy" value={selected.focal.fy} onChange={(fy) => updateIntrinsics(selected.focal.fx, fy, selected.focal.cx, selected.focal.cy)} />
                 <NumberField label="cx" value={selected.focal.cx} onChange={(cx) => updateIntrinsics(selected.focal.fx, selected.focal.fy, cx, selected.focal.cy)} />
@@ -1493,11 +1619,29 @@ function CamerasStructureModal({
   );
 }
 
-function NumberField({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {
+function NumberField({
+  label,
+  value,
+  onChange,
+  readOnly = false,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+  readOnly?: boolean;
+}) {
   return (
     <label className="number-field">
       <span>{label}</span>
-      <input type="number" step="0.001" value={Number(value.toFixed(6))} onChange={(event) => onChange(Number(event.target.value))} />
+      <input
+        type="number"
+        step="0.001"
+        value={Number(value.toFixed(6))}
+        readOnly={readOnly}
+        onChange={(event) => {
+          if (!readOnly) onChange(Number(event.target.value));
+        }}
+      />
     </label>
   );
 }
@@ -1662,6 +1806,93 @@ function distanceForFirst80(frames: Array<{ center: [number, number, number] }>)
   };
 }
 
+function trajectoryPathStats(frames: Array<{ center: [number, number, number] }>) {
+  let cumulative = 0;
+  let first80Cumulative = 0;
+  for (let index = 1; index < frames.length; index += 1) {
+    const distance = pathLengthMeters(frames[index - 1].center, frames[index].center);
+    cumulative += distance;
+    if (index <= 80) {
+      first80Cumulative += distance;
+    }
+  }
+  return {
+    cumulative,
+    first80Cumulative,
+    endToEnd: frames.length > 1 ? pathLengthMeters(frames[0].center, frames[frames.length - 1].center) : 0,
+  };
+}
+
+function pathPlannerPathStats(pathPlanner: PathPlannerDraft) {
+  const anchors = pathPlanner.anchors.length >= 2 ? pathPlanner.anchors : [pathPlanner.start, pathPlanner.end];
+  let cumulative = 0;
+  for (let index = 1; index < anchors.length; index += 1) {
+    cumulative += pathLengthMeters(anchors[index - 1], anchors[index]);
+  }
+  return {
+    cumulative,
+    endToEnd: anchors.length > 1 ? pathLengthMeters(anchors[0], anchors[anchors.length - 1]) : 0,
+  };
+}
+
+function buildPathViewWarnings(pathPlanner: PathPlannerDraft) {
+  const anchors = pathPlanner.anchors.length >= 2 ? pathPlanner.anchors : [pathPlanner.start, pathPlanner.end];
+  const warnings: Array<{ anchorIndex: number; frameLabel: string; angleDeg: number }> = [];
+  for (let index = 1; index < anchors.length; index += 1) {
+    const previous = pathPlannerForwardForAnchor(anchors[index - 1], index - 1, anchors, pathPlanner);
+    const current = pathPlannerForwardForAnchor(anchors[index], index, anchors, pathPlanner);
+    const angleDeg = angleBetweenVectorsDeg(previous, current);
+    if (angleDeg >= 90) {
+      warnings.push({
+        anchorIndex: index,
+        frameLabel: `${index * pathPlanner.frameCount + 1}F`,
+        angleDeg,
+      });
+    }
+  }
+  return warnings;
+}
+
+function pathPlannerForwardForAnchor(
+  anchor: [number, number, number],
+  anchorIndex: number,
+  anchors: [number, number, number][],
+  pathPlanner: PathPlannerDraft,
+) {
+  const lookTarget = pathPlanner.lookTargets?.[anchorIndex];
+  if (lookTarget && pathLengthMeters(anchor, lookTarget) > 1e-6) {
+    return normalizeVector(subtractVector(lookTarget, anchor));
+  }
+  const next = anchors[anchorIndex + 1];
+  if (next && pathLengthMeters(anchor, next) > 1e-6) {
+    return normalizeVector(subtractVector(next, anchor));
+  }
+  const previous = anchors[anchorIndex - 1];
+  if (previous && pathLengthMeters(previous, anchor) > 1e-6) {
+    return normalizeVector(subtractVector(anchor, previous));
+  }
+  return [0, 0, 1] as [number, number, number];
+}
+
+function angleBetweenVectorsDeg(left: [number, number, number], right: [number, number, number]) {
+  const dot = Math.min(1, Math.max(-1, left[0] * right[0] + left[1] * right[1] + left[2] * right[2]));
+  return (Math.acos(dot) * 180) / Math.PI;
+}
+
+function normalizeVector(value: [number, number, number]): [number, number, number] {
+  const length = Math.hypot(value[0], value[1], value[2]);
+  if (length <= 1e-8) return [0, 0, 1];
+  return [value[0] / length, value[1] / length, value[2] / length];
+}
+
+function subtractVector(left: [number, number, number], right: [number, number, number]): [number, number, number] {
+  return [left[0] - right[0], left[1] - right[1], left[2] - right[2]];
+}
+
+function addVector(left: [number, number, number], right: [number, number, number]): [number, number, number] {
+  return [left[0] + right[0], left[1] + right[1], left[2] + right[2]];
+}
+
 function cameraSetPriority(key: string) {
   const normalized = key.toLowerCase();
   if (normalized.includes("render")) return 0;
@@ -1690,6 +1921,21 @@ function nearestSourceFrame<T extends { sourceFrameIndex?: number; index: number
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+function clampIndex(index: number, length: number) {
+  if (length <= 0) return 0;
+  return Math.min(length - 1, Math.max(0, Math.round(index || 0)));
+}
+
+function nearestAnchorIndexForFrame(frameIndex: number, pathPlanner: PathPlannerDraft) {
+  const frameCount = Math.max(1, Math.round(pathPlanner.frameCount || 80));
+  const anchorCount = Math.max(1, pathPlanner.anchors.length || 1);
+  return clampIndex(Math.round(frameIndex / frameCount), anchorCount);
+}
+
+function frameIndexForAnchor(anchorIndex: number, pathPlanner: PathPlannerDraft) {
+  return Math.max(0, Math.round(anchorIndex * Math.max(1, pathPlanner.frameCount || 80)));
 }
 
 function formatOptionalNumber(value: number | null | undefined): string {

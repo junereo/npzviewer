@@ -214,6 +214,46 @@ select {
   color: #e8edf5;
 }
 
+.view-frame-controls {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  z-index: 4;
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+  transform: translateY(-50%);
+  padding: 6px;
+  border: 1px solid #303746;
+  border-radius: 7px;
+  background: rgb(13 17 24 / 90%);
+}
+
+.view-frame-controls button {
+  width: 34px;
+  height: 34px;
+  border: 1px solid #303746;
+  border-radius: 6px;
+  background: #161b24;
+  color: #e8edf5;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.view-frame-controls button:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+
+.view-frame-controls span {
+  min-width: 42px;
+  color: #ffcc66;
+  font-size: 11px;
+  font-weight: 800;
+  text-align: center;
+}
+
 .scrubber {
   width: calc(100% - 28px);
   margin: 0 14px;
@@ -1146,6 +1186,7 @@ select {
 .path-planner > .path-primary-actions,
 .path-planner > .path-history-actions,
 .path-planner > .path-notice,
+.path-planner > .view-target-card,
 .path-planner > .path-points-grid,
 .path-planner > .pose-scale-helper {
   grid-column: 1 / -1;
@@ -1157,6 +1198,7 @@ select {
 
 .path-notice,
 .path-readout,
+.view-target-card,
 .pose-scale-helper,
 .path-plane-wrap {
   display: grid;
@@ -1204,6 +1246,7 @@ select {
 }
 
 .path-notice strong,
+.view-target-card strong,
 .pose-scale-helper strong,
 .path-readout strong {
   color: #dbeafe;
@@ -1211,12 +1254,41 @@ select {
 }
 
 .path-notice span,
+.view-target-card span,
 .pose-scale-helper span,
 .path-readout span,
 .path-plane-wrap span {
   color: #aeb8c8;
   font-size: 11px;
   line-height: 1.35;
+}
+
+.view-target-card {
+  grid-template-columns: minmax(0, 1fr) minmax(140px, auto);
+  align-items: center;
+}
+
+.view-target-card > div {
+  display: grid;
+  gap: 3px;
+}
+
+.view-target-card > span,
+.view-target-card > .view-warning {
+  grid-column: 1 / -1;
+}
+
+.view-warning {
+  display: grid;
+  gap: 4px;
+  padding: 7px;
+  border: 1px solid #7f1d1d;
+  border-radius: 6px;
+  background: #3a1418;
+}
+
+.view-warning span {
+  color: #fecdd3;
 }
 
 .path-planner-actions,
@@ -1554,6 +1626,7 @@ select {
   .path-planner > .path-primary-actions,
   .path-planner > .path-history-actions,
   .path-planner > .path-notice,
+  .path-planner > .view-target-card,
   .path-planner > .path-points-grid,
   .path-planner > .pose-scale-helper,
   .path-planner > .path-planner-actions,

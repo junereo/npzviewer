@@ -5,6 +5,8 @@ import * as THREE from "three";
 import { alignOverlayFrames, cameraYawPitchFromW2c, forwardFromYawPitch, toDisplayVec3 } from "../math.mjs";
 import type { CameraOverlayFrame, CameraOverlaySet, CamerasDocument, PathPlannerDraft, TrajectoryDocument, VipeDocument } from "../types";
 
+const PLANNER_VIEW_DEPTH = 0.75;
+
 type Props = {
   document: TrajectoryDocument | null;
   cameras: CamerasDocument | null;
@@ -24,6 +26,7 @@ type Props = {
   onPathPlannerPointAdd: (point: [number, number, number]) => void;
   onPathPlannerAnchorEditStart: () => void;
   onPathPlannerAnchorChange: (anchorIndex: number, point: [number, number, number]) => void;
+  onPathPlannerViewTargetChange: (anchorIndex: number, target: [number, number, number]) => void;
 };
 
 export function TrajectoryCanvas({
@@ -45,10 +48,25 @@ export function TrajectoryCanvas({
   onPathPlannerPointAdd,
   onPathPlannerAnchorEditStart,
   onPathPlannerAnchorChange,
+  onPathPlannerViewTargetChange,
 }: Props) {
+  const maxFrameIndex = Math.max(0, (document?.frames.length ?? 1) - 1);
+
+  function selectRelativeFrame(delta: number) {
+    const nextFrame = Math.min(maxFrameIndex, Math.max(0, selectedFrame + delta));
+    onSelectFrame(nextFrame);
+    onPathPlannerChange({
+      ...pathPlanner,
+      selectedViewAnchor: nearestAnchorIndexForFrame(nextFrame, pathPlanner),
+    });
+  }
+
   return (
     <div className="trajectory-canvas">
-      <div className="projection-controls" aria-label="경로 편집 투영 평면">
+      <div className="projection-controls" aria-label="경로 편집 뷰">
+        <button className={pathPlanner.projection === "free" ? "active" : ""} onClick={() => onPathPlannerChange({ ...pathPlanner, projection: "free" })}>
+          3D 자유
+        </button>
         <button className={pathPlanner.projection === "xz" ? "active" : ""} onClick={() => onPathPlannerChange({ ...pathPlanner, projection: "xz" })}>
           Y 기준 X-Z
         </button>
@@ -56,6 +74,33 @@ export function TrajectoryCanvas({
           X 기준 Z-Y
         </button>
       </div>
+      {pathPlanner.viewEditMode ? (
+        <div className="view-frame-controls" aria-label="시야 설정 프레임 이동">
+          <button
+            type="button"
+            aria-label="이전 프레임"
+            disabled={!document || selectedFrame <= 0}
+            onClick={(event) => {
+              event.stopPropagation();
+              selectRelativeFrame(-1);
+            }}
+          >
+            -
+          </button>
+          <span>{selectedFrame}F</span>
+          <button
+            type="button"
+            aria-label="다음 프레임"
+            disabled={!document || selectedFrame >= maxFrameIndex}
+            onClick={(event) => {
+              event.stopPropagation();
+              selectRelativeFrame(1);
+            }}
+          >
+            +
+          </button>
+        </div>
+      ) : null}
       <Canvas camera={{ position: [3.5, 2.5, 4.5], fov: 45 }}>
         <FixedProjectionCamera projection={pathPlanner.projection} />
         <color attach="background" args={["#101319"]} />
@@ -66,10 +111,13 @@ export function TrajectoryCanvas({
         <AxisLabels mode={displayAxisMode} yDirection={displayYDirection} />
         <PathPlannerScene
           draft={pathPlanner}
+          selectedFrameCenter={document?.frames[selectedFrame]?.center ?? null}
           onChange={onPathPlannerChange}
           onPointAdd={onPathPlannerPointAdd}
           onAnchorEditStart={onPathPlannerAnchorEditStart}
           onAnchorChange={onPathPlannerAnchorChange}
+          onViewTargetChange={onPathPlannerViewTargetChange}
+          onSelectAnchorFrame={onSelectFrame}
           displayAxisMode={displayAxisMode}
           displayYDirection={displayYDirection}
         />
@@ -106,7 +154,13 @@ export function TrajectoryCanvas({
           playbackFrame={playbackFrame}
           videoElement={videoElement}
         />
-        <OrbitControls makeDefault enableRotate={false} enablePan={false} enableZoom enableDamping />
+        <OrbitControls
+          makeDefault
+          enableRotate={pathPlanner.projection === "free"}
+          enablePan={pathPlanner.projection === "free"}
+          enableZoom
+          enableDamping
+        />
       </Canvas>
     </div>
   );
@@ -116,6 +170,13 @@ function FixedProjectionCamera({ projection }: { projection: PathPlannerDraft["p
   const { camera } = useThree();
 
   useEffect(() => {
+    if (projection === "free") {
+      camera.position.set(3.5, 2.5, 4.5);
+      camera.up.set(0, 1, 0);
+      camera.lookAt(0, 0, 0);
+      camera.updateProjectionMatrix();
+      return;
+    }
     if (projection === "zy") {
       camera.position.set(7, 0, 0);
       camera.up.set(0, 1, 0);
@@ -132,23 +193,31 @@ function FixedProjectionCamera({ projection }: { projection: PathPlannerDraft["p
 
 function PathPlannerScene({
   draft,
+  selectedFrameCenter,
   onChange,
   onPointAdd,
   onAnchorEditStart,
   onAnchorChange,
+  onViewTargetChange,
+  onSelectAnchorFrame,
   displayAxisMode,
   displayYDirection,
 }: {
   draft: PathPlannerDraft;
+  selectedFrameCenter: [number, number, number] | null;
   onChange: (draft: PathPlannerDraft) => void;
   onPointAdd: (point: [number, number, number]) => void;
   onAnchorEditStart: () => void;
   onAnchorChange: (anchorIndex: number, point: [number, number, number]) => void;
+  onViewTargetChange: (anchorIndex: number, target: [number, number, number]) => void;
+  onSelectAnchorFrame: (frame: number) => void;
   displayAxisMode: "y-up" | "z-up";
   displayYDirection: "positive-up" | "positive-down";
 }) {
   const [dragging, setDragging] = useState<number | "start" | "end" | null>(null);
   const anchors = draft.anchors.length ? draft.anchors : [draft.start, draft.end];
+  const selectedViewAnchor = clampIndex(draft.selectedViewAnchor, anchors.length);
+  const editProjection = draft.projection === "zy" ? "zy" : "xz";
   const displayAnchors = useMemo(
     () => anchors.map((anchor) => plannerDisplayTuple(anchor, draft.projection, displayAxisMode, displayYDirection)),
     [anchors, draft.projection, displayAxisMode, displayYDirection],
@@ -164,22 +233,28 @@ function PathPlannerScene({
       ),
     [points],
   );
+  const viewFrustums = useMemo(
+    () =>
+      anchors.map((anchor, anchorIndex) =>
+        makePlannerViewFrustum(anchor, anchorIndex, anchors, draft, displayAxisMode, displayYDirection),
+      ),
+    [anchors, draft, displayAxisMode, displayYDirection],
+  );
 
-  function pointFromEvent(event: { point: THREE.Vector3 }) {
-    const lastAnchor = anchors[anchors.length - 1] ?? draft.start;
-    if (draft.projection === "zy") {
-      return [lastAnchor[0], Number((-event.point.y).toFixed(3)), Number(event.point.z.toFixed(3))] as [number, number, number];
+  function pointFromEvent(event: { point: THREE.Vector3 }, baseAnchor = anchors[anchors.length - 1] ?? draft.start) {
+    if (editProjection === "zy") {
+      return [baseAnchor[0], Number((-event.point.y).toFixed(3)), Number(event.point.z.toFixed(3))] as [number, number, number];
     }
-    return [Number(event.point.x.toFixed(3)), lastAnchor[1], Number(event.point.z.toFixed(3))] as [number, number, number];
+    return [Number(event.point.x.toFixed(3)), baseAnchor[1], Number(event.point.z.toFixed(3))] as [number, number, number];
   }
 
   function updatePoint(anchorIndex: number | "start" | "end", event: { point: THREE.Vector3; stopPropagation: () => void }) {
     event.stopPropagation();
     const resolvedIndex = anchorIndex === "start" ? 0 : anchorIndex === "end" ? anchors.length - 1 : anchorIndex;
-    onAnchorChange(resolvedIndex, pointFromEvent(event));
+    onAnchorChange(resolvedIndex, pointFromEvent(event, anchors[resolvedIndex]));
   }
 
-  const planeRotation: [number, number, number] = draft.projection === "zy" ? [0, Math.PI / 2, 0] : [-Math.PI / 2, 0, 0];
+  const planeRotation: [number, number, number] = editProjection === "zy" ? [0, Math.PI / 2, 0] : [-Math.PI / 2, 0, 0];
 
   return (
     <group>
@@ -188,7 +263,9 @@ function PathPlannerScene({
         position={[0, 0, 0]}
         onClick={(event) => {
           event.stopPropagation();
-          if (draft.clickCreateMode && dragging === null) {
+          if (draft.viewEditMode && dragging === null) {
+            onViewTargetChange(selectedViewAnchor, pointFromEvent(event, selectedFrameCenter ?? anchors[selectedViewAnchor]));
+          } else if (draft.clickCreateMode && dragging === null) {
             onPointAdd(pointFromEvent(event));
           }
         }}
@@ -204,23 +281,42 @@ function PathPlannerScene({
         <planeGeometry args={[8, 8]} />
         <meshBasicMaterial color="#172033" transparent opacity={0.22} side={THREE.DoubleSide} />
       </mesh>
+      {viewFrustums.map((frustum) => (
+        <PathPlannerViewFrustum
+          key={`planner-view-${frustum.anchorIndex}`}
+          geometry={frustum.geometry}
+          targetPosition={frustum.targetDisplay}
+          selected={frustum.anchorIndex === selectedViewAnchor}
+          warning={frustum.warning}
+        />
+      ))}
       <primitive object={pathLine} />
       <PathPlannerPoint
         label="시작"
         color="#22c55e"
         position={start}
+        selected={selectedViewAnchor === 0}
         onPointerDown={() => {
-          onAnchorEditStart();
-          setDragging("start");
+          onChange({ ...draft, selectedViewAnchor: 0 });
+          onSelectAnchorFrame(0);
+          if (!draft.viewEditMode) {
+            onAnchorEditStart();
+            setDragging("start");
+          }
         }}
       />
       <PathPlannerPoint
         label="끝"
         color="#f97316"
         position={end}
+        selected={selectedViewAnchor === anchors.length - 1}
         onPointerDown={() => {
-          onAnchorEditStart();
-          setDragging("end");
+          onChange({ ...draft, selectedViewAnchor: anchors.length - 1 });
+          onSelectAnchorFrame(frameIndexForAnchor(anchors.length - 1, draft));
+          if (!draft.viewEditMode) {
+            onAnchorEditStart();
+            setDragging("end");
+          }
         }}
       />
       {displayAnchors.slice(1, -1).map((position, offset) => {
@@ -231,9 +327,14 @@ function PathPlannerScene({
             label={`${anchorIndex * draft.frameCount + 1}F`}
             color="#ffcc66"
             position={position}
+            selected={selectedViewAnchor === anchorIndex}
             onPointerDown={() => {
-              onAnchorEditStart();
-              setDragging(anchorIndex);
+              onChange({ ...draft, selectedViewAnchor: anchorIndex });
+              onSelectAnchorFrame(frameIndexForAnchor(anchorIndex, draft));
+              if (!draft.viewEditMode) {
+                onAnchorEditStart();
+                setDragging(anchorIndex);
+              }
             }}
           />
         );
@@ -244,7 +345,9 @@ function PathPlannerScene({
         </Html>
       ))}
       <Html position={[0, 0.08, -3.65]} center>
-        <div className="canvas-label">X-Z 경로 평면: 점을 드래그해서 새 trajectory를 만드세요</div>
+        <div className="canvas-label">
+          {draft.projection === "zy" ? "Z-Y 경로 평면" : draft.projection === "xz" ? "X-Z 경로 평면" : "3D 자유 뷰"}
+        </div>
       </Html>
     </group>
   );
@@ -254,11 +357,13 @@ function PathPlannerPoint({
   label,
   color,
   position,
+  selected = false,
   onPointerDown,
 }: {
   label: string;
   color: string;
   position: [number, number, number];
+  selected?: boolean;
   onPointerDown: () => void;
 }) {
   return (
@@ -269,12 +374,37 @@ function PathPlannerPoint({
           onPointerDown();
         }}
       >
-        <sphereGeometry args={[0.09, 24, 24]} />
-        <meshStandardMaterial color={color} emissive={color} emissiveIntensity={0.25} />
+        <sphereGeometry args={[selected ? 0.12 : 0.09, 24, 24]} />
+        <meshStandardMaterial color={selected ? "#f8fafc" : color} emissive={color} emissiveIntensity={selected ? 0.55 : 0.25} />
       </mesh>
       <Html position={[0, 0.18, 0]} center>
         <div className="canvas-label path-point-label-hidden">{label}</div>
       </Html>
+    </group>
+  );
+}
+
+function PathPlannerViewFrustum({
+  geometry,
+  targetPosition,
+  selected,
+  warning,
+}: {
+  geometry: THREE.BufferGeometry;
+  targetPosition: [number, number, number];
+  selected: boolean;
+  warning: boolean;
+}) {
+  const color = warning ? "#fb7185" : selected ? "#38bdf8" : "#8ddcff";
+  return (
+    <group>
+      <lineSegments geometry={geometry}>
+        <lineBasicMaterial color={color} transparent opacity={selected ? 0.98 : 0.58} />
+      </lineSegments>
+      <mesh position={targetPosition}>
+        <sphereGeometry args={[selected ? 0.055 : 0.038, 16, 16]} />
+        <meshStandardMaterial color={color} emissive={color} emissiveIntensity={0.35} />
+      </mesh>
     </group>
   );
 }
@@ -286,7 +416,108 @@ function plannerDisplayTuple(
   yDirection: "positive-up" | "positive-down",
 ): [number, number, number] {
   const display = displayTuple(value, mode, yDirection);
+  if (projection === "free") {
+    return display;
+  }
   return projection === "zy" ? [0, display[1], display[2]] : [display[0], 0, display[2]];
+}
+
+function makePlannerViewFrustum(
+  anchor: [number, number, number],
+  anchorIndex: number,
+  anchors: [number, number, number][],
+  draft: PathPlannerDraft,
+  displayAxisMode: "y-up" | "z-up",
+  displayYDirection: "positive-up" | "positive-down",
+) {
+  const forward = plannerForwardForAnchor(anchor, anchorIndex, anchors, draft);
+  const target = addVec(anchor, scaleVec(forward, PLANNER_VIEW_DEPTH));
+  const distance = PLANNER_VIEW_DEPTH;
+  const upHint: [number, number, number] = Math.abs(forward[1]) > 0.92 ? [1, 0, 0] : [0, 1, 0];
+  const right = normalizeVec(crossVec(upHint, forward));
+  const up = normalizeVec(crossVec(forward, right));
+  const horizontalFov = 2 * Math.atan(Math.max(1, draft.imageWidth) / (2 * Math.max(1, draft.fx)));
+  const verticalFov = 2 * Math.atan(Math.max(1, draft.imageHeight) / (2 * Math.max(1, draft.fy)));
+  const center = addVec(anchor, scaleVec(forward, distance));
+  const halfRight = scaleVec(right, Math.tan(horizontalFov / 2) * distance);
+  const halfUp = scaleVec(up, Math.tan(verticalFov / 2) * distance);
+  const corners = [
+    subVec(subVec(center, halfRight), halfUp),
+    addVec(subVec(center, halfUp), halfRight),
+    subVec(addVec(center, halfUp), halfRight),
+    addVec(addVec(center, halfUp), halfRight),
+  ].map((corner) => vec3(plannerDisplayTuple(corner, draft.projection, displayAxisMode, displayYDirection)));
+  const origin = vec3(plannerDisplayTuple(anchor, draft.projection, displayAxisMode, displayYDirection));
+  const targetDisplay = plannerDisplayTuple(target, draft.projection, displayAxisMode, displayYDirection);
+  const previousForward = anchorIndex > 0 ? plannerForwardForAnchor(anchors[anchorIndex - 1], anchorIndex - 1, anchors, draft) : null;
+
+  return {
+    anchorIndex,
+    targetDisplay,
+    warning: previousForward ? angleBetweenDeg(previousForward, forward) >= 90 : false,
+    geometry: new THREE.BufferGeometry().setFromPoints([
+      origin,
+      vec3(targetDisplay),
+      origin,
+      corners[0],
+      origin,
+      corners[1],
+      origin,
+      corners[2],
+      origin,
+      corners[3],
+      corners[0],
+      corners[1],
+      corners[1],
+      corners[3],
+      corners[3],
+      corners[2],
+      corners[2],
+      corners[0],
+    ]),
+  };
+}
+
+function plannerForwardForAnchor(anchor: [number, number, number], anchorIndex: number, anchors: [number, number, number][], draft: PathPlannerDraft) {
+  const lookTarget = draft.lookTargets?.[anchorIndex];
+  if (lookTarget && vecLength(subVec(lookTarget, anchor)) > 1e-6) {
+    return normalizeVec(subVec(lookTarget, anchor));
+  }
+  const next = anchors[anchorIndex + 1];
+  if (next && vecLength(subVec(next, anchor)) > 1e-6) {
+    return normalizeVec(subVec(next, anchor));
+  }
+  const previous = anchors[anchorIndex - 1];
+  if (previous && vecLength(subVec(anchor, previous)) > 1e-6) {
+    return normalizeVec(subVec(anchor, previous));
+  }
+  return [0, 0, 1] as [number, number, number];
+}
+
+function angleBetweenDeg(left: [number, number, number], right: [number, number, number]) {
+  const normalizedLeft = normalizeVec(left);
+  const normalizedRight = normalizeVec(right);
+  const dot = Math.min(1, Math.max(-1, normalizedLeft[0] * normalizedRight[0] + normalizedLeft[1] * normalizedRight[1] + normalizedLeft[2] * normalizedRight[2]));
+  return (Math.acos(dot) * 180) / Math.PI;
+}
+
+function vecLength(value: [number, number, number]) {
+  return Math.hypot(value[0], value[1], value[2]);
+}
+
+function clampIndex(index: number, length: number) {
+  if (length <= 0) return 0;
+  return Math.min(length - 1, Math.max(0, Math.round(index || 0)));
+}
+
+function nearestAnchorIndexForFrame(frameIndex: number, draft: PathPlannerDraft) {
+  const frameCount = Math.max(1, Math.round(draft.frameCount || 80));
+  const anchorCount = Math.max(1, draft.anchors.length || 1);
+  return clampIndex(Math.round(frameIndex / frameCount), anchorCount);
+}
+
+function frameIndexForAnchor(anchorIndex: number, draft: PathPlannerDraft) {
+  return Math.max(0, Math.round(anchorIndex * Math.max(1, draft.frameCount || 80)));
 }
 
 function SyncedVideoFrame({

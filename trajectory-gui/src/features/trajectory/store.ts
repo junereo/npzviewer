@@ -1,5 +1,13 @@
 import { create } from "zustand";
-import { applyTrajectoryTransform, generatePathFrames, normalizePathDistance, pathLengthMeters } from "./math.mjs";
+import {
+  applyTrajectoryTransform,
+  cameraAxesFromW2c,
+  generatePathFrames,
+  normalizePathDistance,
+  pathLengthMeters,
+  w2cFromCenterForward,
+  yawPitchFromForward,
+} from "./math.mjs";
 import type { CameraFrame, CamerasDocument, PathPlannerDraft, TrajectoryDocument, TransformDraft, VipeDocument } from "./types";
 
 type PathPlannerHistorySnapshot = {
@@ -46,8 +54,12 @@ type TrajectoryState = {
   undoPathPlanner: () => void;
   redoPathPlanner: () => void;
   updatePathPlannerAnchor: (anchorIndex: number, point: [number, number, number]) => void;
+  updatePathPlannerLookTarget: (anchorIndex: number, target: [number, number, number]) => void;
+  updateFrameCenter: (frameIndex: number, center: [number, number, number]) => void;
+  updateFrameForward: (frameIndex: number, forward: [number, number, number]) => void;
   cropFrames: (frameCount: number) => void;
   updateIntrinsics: (fx: number, fy: number, cx: number, cy: number) => void;
+  updateResolution: (imageWidth: number, imageHeight: number) => void;
 };
 
 const defaultTransform: TransformDraft = { scale: 1, translate: [0, 0, 0], rotateEulerDeg: [0, 0, 0] };
@@ -56,21 +68,30 @@ const defaultIntrinsics = [
   [0, 804, 360],
   [0, 0, 1],
 ];
+const defaultPoseScale = 1.1;
+const defaultExpectedMeters = 3;
 const defaultPathPlanner: PathPlannerDraft = {
   fps: 16,
   durationSec: 5,
   frameCount: 80,
+  imageWidth: 1280,
+  imageHeight: 720,
+  fx: 804,
+  fy: 804,
   start: [0, 0, 0],
   end: [0, 0, 3],
   anchors: [[0, 0, 0]],
+  lookTargets: [null],
+  viewEditMode: false,
+  selectedViewAnchor: 0,
   clickCreateMode: false,
-  projection: "xz",
+  projection: "free",
   yawDeg: 0,
   pitchDeg: 0,
   povMode: "follow-path",
   easing: "linear",
-  expectedMeters: 3,
-  observedMeters: 3,
+  expectedMeters: defaultExpectedMeters,
+  observedMeters: defaultExpectedMeters / defaultPoseScale,
 };
 
 export const useTrajectoryStore = create<TrajectoryState>((set, get) => ({
@@ -133,6 +154,8 @@ export const useTrajectoryStore = create<TrajectoryState>((set, get) => ({
       pathPlanner: {
         ...pathPlanner,
         anchors: [[...pathPlanner.start] as [number, number, number]],
+        lookTargets: [null],
+        selectedViewAnchor: 0,
         end: [...pathPlanner.start] as [number, number, number],
         clickCreateMode: true,
       },
@@ -156,13 +179,22 @@ export const useTrajectoryStore = create<TrajectoryState>((set, get) => ({
       lastAnchor[2] + nextDelta[2],
     ] as [number, number, number];
     const nextAnchors = [...anchors, nextAnchor];
-    setTrajectoryFromAnchors(set, state, nextAnchors, {
-      ...pathPlanner,
-      anchors: nextAnchors,
-      start: lastAnchor,
-      end: nextAnchor,
-      expectedMeters: pathLengthMeters(lastAnchor, nextAnchor),
-    }, { recordHistory: true });
+    const nextLookTargets = appendInheritedLookTarget(pathPlanner.lookTargets, anchors, nextAnchor);
+    setTrajectoryFromAnchors(
+      set,
+      state,
+      nextAnchors,
+      {
+        ...pathPlanner,
+        anchors: nextAnchors,
+        lookTargets: nextLookTargets,
+        selectedViewAnchor: nextAnchors.length - 1,
+        start: lastAnchor,
+        end: nextAnchor,
+        expectedMeters: pathLengthMeters(lastAnchor, nextAnchor),
+      },
+      { recordHistory: true, selectedFrame: frameIndexForAnchor(nextAnchors.length - 1, pathPlanner) },
+    );
   },
   addPathPlannerPoint: (point) => {
     const state = get();
@@ -171,14 +203,23 @@ export const useTrajectoryStore = create<TrajectoryState>((set, get) => ({
     const last = anchors[anchors.length - 1];
     if (Math.hypot(point[0] - last[0], point[1] - last[1], point[2] - last[2]) <= 1e-6) return;
     const nextAnchors = [...anchors, point];
-    setTrajectoryFromAnchors(set, state, nextAnchors, {
-      ...pathPlanner,
-      anchors: nextAnchors,
-      start: nextAnchors[Math.max(0, nextAnchors.length - 2)],
-      end: point,
-      clickCreateMode: true,
-      expectedMeters: pathLengthMeters(nextAnchors[Math.max(0, nextAnchors.length - 2)], point),
-    }, { recordHistory: true });
+    const nextLookTargets = appendInheritedLookTarget(pathPlanner.lookTargets, anchors, point);
+    setTrajectoryFromAnchors(
+      set,
+      state,
+      nextAnchors,
+      {
+        ...pathPlanner,
+        anchors: nextAnchors,
+        lookTargets: nextLookTargets,
+        selectedViewAnchor: nextAnchors.length - 1,
+        start: nextAnchors[Math.max(0, nextAnchors.length - 2)],
+        end: point,
+        clickCreateMode: true,
+        expectedMeters: pathLengthMeters(nextAnchors[Math.max(0, nextAnchors.length - 2)], point),
+      },
+      { recordHistory: true, selectedFrame: frameIndexForAnchor(nextAnchors.length - 1, pathPlanner) },
+    );
   },
   checkpointPathPlannerHistory: () => {
     const state = get();
@@ -214,17 +255,78 @@ export const useTrajectoryStore = create<TrajectoryState>((set, get) => ({
     const pathPlanner = state.pathPlanner;
     const anchors = pathPlanner.anchors.length ? pathPlanner.anchors : anchorsFromDocument(state.document, pathPlanner);
     if (anchorIndex < 0 || anchorIndex >= anchors.length) return;
+    const oldAnchor = anchors[anchorIndex];
     const nextAnchors = anchors.map((anchor, index) => (index === anchorIndex ? point : anchor)) as [number, number, number][];
+    const lookTargets = normalizedLookTargets(pathPlanner.lookTargets, anchors.length).map((target, index) =>
+      target && index === anchorIndex
+        ? ([target[0] + point[0] - oldAnchor[0], target[1] + point[1] - oldAnchor[1], target[2] + point[2] - oldAnchor[2]] as [number, number, number])
+        : target,
+    );
     const selectedStartIndex = Math.max(0, Math.min(anchorIndex, nextAnchors.length - 2));
     const selectedEndIndex = Math.min(nextAnchors.length - 1, selectedStartIndex + 1);
-    setTrajectoryFromAnchors(set, state, nextAnchors, {
-      ...pathPlanner,
-      anchors: nextAnchors,
-      start: nextAnchors[selectedStartIndex],
-      end: nextAnchors[selectedEndIndex],
-      expectedMeters:
-        selectedStartIndex === selectedEndIndex ? 0 : pathLengthMeters(nextAnchors[selectedStartIndex], nextAnchors[selectedEndIndex]),
+    setTrajectoryFromAnchors(
+      set,
+      state,
+      nextAnchors,
+      {
+        ...pathPlanner,
+        anchors: nextAnchors,
+        lookTargets,
+        selectedViewAnchor: anchorIndex,
+        start: nextAnchors[selectedStartIndex],
+        end: nextAnchors[selectedEndIndex],
+        expectedMeters:
+          selectedStartIndex === selectedEndIndex ? 0 : pathLengthMeters(nextAnchors[selectedStartIndex], nextAnchors[selectedEndIndex]),
+      },
+      { selectedFrame: frameIndexForAnchor(anchorIndex, pathPlanner) },
+    );
+  },
+  updatePathPlannerLookTarget: (anchorIndex, target) => {
+    const state = get();
+    const pathPlanner = state.pathPlanner;
+    const anchors = pathPlanner.anchors.length ? pathPlanner.anchors : anchorsFromDocument(state.document, pathPlanner);
+    if (anchorIndex < 0 || anchorIndex >= anchors.length) return;
+    const lookTargets = normalizedLookTargets(pathPlanner.lookTargets, anchors.length);
+    lookTargets[anchorIndex] = fixedDepthLookTarget(anchors[anchorIndex], target);
+    setTrajectoryFromAnchors(
+      set,
+      state,
+      anchors,
+      {
+        ...pathPlanner,
+        anchors,
+        lookTargets,
+        selectedViewAnchor: anchorIndex,
+        povMode: "manual",
+      },
+      { recordHistory: true, selectedFrame: frameIndexForAnchor(anchorIndex, pathPlanner) },
+    );
+  },
+  updateFrameCenter: (frameIndex, center) => {
+    const document = get().document;
+    if (!document || frameIndex < 0 || frameIndex >= document.frames.length) return;
+    const frames = document.frames.map((frame) => {
+      if (frame.index !== frameIndex) return frame;
+      const forward = cameraAxesFromW2c(frame.w2c, "plus-z").forward;
+      return {
+        ...frame,
+        center,
+        w2c: w2cFromCenterForward(center, forward),
+      };
     });
+    set({ document: { ...document, frames }, selectedFrame: frameIndex });
+  },
+  updateFrameForward: (frameIndex, forward) => {
+    const document = get().document;
+    if (!document || frameIndex < 0 || frameIndex >= document.frames.length) return;
+    const frames = document.frames.map((frame) => {
+      if (frame.index !== frameIndex) return frame;
+      return {
+        ...frame,
+        w2c: w2cFromCenterForward(frame.center, forward),
+      };
+    });
+    set({ document: { ...document, frames }, selectedFrame: frameIndex });
   },
   cropFrames: (frameCount) => {
     const document = get().document;
@@ -246,6 +348,34 @@ export const useTrajectoryStore = create<TrajectoryState>((set, get) => ({
     }));
     set({ document: { ...document, frames } });
   },
+  updateResolution: (imageWidth, imageHeight) => {
+    const document = get().document;
+    if (!document) return;
+    const nextWidth = Math.max(1, Math.round(imageWidth));
+    const nextHeight = Math.max(1, Math.round(imageHeight));
+    const cx = nextWidth / 2;
+    const cy = nextHeight / 2;
+    const frames = document.frames.map((frame) => {
+      const fx = frame.focal.fx;
+      const fy = frame.focal.fy;
+      return {
+        ...frame,
+        focal: { fx, fy, cx, cy },
+        intrinsics: [
+          [fx, 0, cx],
+          [0, fy, cy],
+          [0, 0, 1],
+        ],
+      };
+    });
+    set({
+      document: {
+        ...document,
+        meta: { ...document.meta, imageWidth: nextWidth, imageHeight: nextHeight },
+        frames,
+      },
+    });
+  },
 }));
 
 function cloneDefaultPathPlanner(): PathPlannerDraft {
@@ -254,6 +384,7 @@ function cloneDefaultPathPlanner(): PathPlannerDraft {
     start: [...defaultPathPlanner.start],
     end: [...defaultPathPlanner.end],
     anchors: defaultPathPlanner.anchors.map((anchor) => [...anchor] as [number, number, number]),
+    lookTargets: defaultPathPlanner.lookTargets.map((target) => (target ? ([...target] as [number, number, number]) : null)),
   };
 }
 
@@ -263,6 +394,9 @@ function clonePathPlanner(pathPlanner: PathPlannerDraft): PathPlannerDraft {
     start: [...pathPlanner.start],
     end: [...pathPlanner.end],
     anchors: pathPlanner.anchors.map((anchor) => [...anchor] as [number, number, number]),
+    lookTargets: normalizedLookTargets(pathPlanner.lookTargets, pathPlanner.anchors.length).map((target) =>
+      target ? ([...target] as [number, number, number]) : null,
+    ),
   };
 }
 
@@ -311,10 +445,10 @@ function setTrajectoryFromAnchors(
   state: TrajectoryState,
   anchors: [number, number, number][],
   pathPlanner: PathPlannerDraft,
-  options: Partial<Pick<TrajectoryState, "pathUndoStack" | "pathRedoStack">> & { recordHistory?: boolean } = {},
+  options: Partial<Pick<TrajectoryState, "pathUndoStack" | "pathRedoStack">> & { recordHistory?: boolean; selectedFrame?: number } = {},
 ) {
   const document = state.document;
-  const intrinsics = document?.frames[0]?.intrinsics ?? defaultIntrinsics;
+  const intrinsics = intrinsicsFromPathPlanner(pathPlanner);
   const frames = generateFramesFromAnchors(anchors, pathPlanner, intrinsics);
   const historyPatch = options.recordHistory
     ? {
@@ -329,13 +463,13 @@ function setTrajectoryFromAnchors(
     document: {
       meta: {
         frameCount: frames.length,
-        imageWidth: document?.meta.imageWidth ?? 1280,
-        imageHeight: document?.meta.imageHeight ?? 720,
+        imageWidth: Math.max(1, Math.round(pathPlanner.imageWidth || document?.meta.imageWidth || 1280)),
+        imageHeight: Math.max(1, Math.round(pathPlanner.imageHeight || document?.meta.imageHeight || 720)),
         dtype: document?.meta.dtype ?? { w2c: "float32", intrinsics: "float32" },
       },
       frames,
     },
-    selectedFrame: Math.max(0, frames.length - 1),
+    selectedFrame: selectedFrameForOptions(options, frames.length),
     pathPlanner,
     ...historyPatch,
   });
@@ -344,15 +478,84 @@ function setTrajectoryFromAnchors(
 function generateFramesFromAnchors(anchors: [number, number, number][], pathPlanner: PathPlannerDraft, intrinsics: number[][]): CameraFrame[] {
   if (anchors.length < 2) return [];
   const frames: CameraFrame[] = [];
+  const lookTargets = normalizedLookTargets(pathPlanner.lookTargets, anchors.length);
   for (let index = 1; index < anchors.length; index += 1) {
+    const lookTarget = lookTargets[index - 1];
+    const direction = lookTarget ? subVec3(lookTarget, anchors[index - 1]) : null;
+    const yawPitch = direction && pathLengthMeters([0, 0, 0], direction) > 1e-6 ? yawPitchFromForward(direction) : null;
     const segmentDraft = {
       ...pathPlanner,
       start: anchors[index - 1],
       end: anchors[index],
+      ...(yawPitch ? { povMode: "manual" as const, yawDeg: yawPitch.yawDeg, pitchDeg: yawPitch.pitchDeg } : {}),
     };
     const segmentFrames = generatePathFrames(segmentDraft, intrinsics) as CameraFrame[];
     const framesToAppend = index === 1 ? segmentFrames : segmentFrames.slice(1);
     frames.push(...framesToAppend.map((frame, offset) => ({ ...frame, index: frames.length + offset })));
   }
   return frames;
+}
+
+function intrinsicsFromPathPlanner(pathPlanner: PathPlannerDraft) {
+  const imageWidth = Math.max(1, Math.round(pathPlanner.imageWidth || 1280));
+  const imageHeight = Math.max(1, Math.round(pathPlanner.imageHeight || 720));
+  const fx = pathPlanner.fx > 0 ? pathPlanner.fx : defaultIntrinsics[0][0];
+  const fy = pathPlanner.fy > 0 ? pathPlanner.fy : defaultIntrinsics[1][1];
+  return [
+    [fx, 0, imageWidth / 2],
+    [0, fy, imageHeight / 2],
+    [0, 0, 1],
+  ];
+}
+
+function appendInheritedLookTarget(
+  lookTargets: ([number, number, number] | null)[] | undefined,
+  anchors: [number, number, number][],
+  nextAnchor: [number, number, number],
+) {
+  const normalized = normalizedLookTargets(lookTargets, anchors.length);
+  const lastAnchor = anchors[anchors.length - 1];
+  const lastTarget = normalized[normalized.length - 1];
+  const inherited = lastTarget
+    ? ([nextAnchor[0] + lastTarget[0] - lastAnchor[0], nextAnchor[1] + lastTarget[1] - lastAnchor[1], nextAnchor[2] + lastTarget[2] - lastAnchor[2]] as [
+        number,
+        number,
+        number,
+      ])
+    : null;
+  return [...normalized, inherited];
+}
+
+function normalizedLookTargets(lookTargets: ([number, number, number] | null)[] | undefined, length: number) {
+  const next = (lookTargets ?? []).slice(0, length);
+  while (next.length < length) next.push(null);
+  return next;
+}
+
+function subVec3(left: [number, number, number], right: [number, number, number]): [number, number, number] {
+  return [left[0] - right[0], left[1] - right[1], left[2] - right[2]];
+}
+
+function fixedDepthLookTarget(anchor: [number, number, number], target: [number, number, number]): [number, number, number] {
+  const direction = subVec3(target, anchor);
+  const length = pathLengthMeters([0, 0, 0], direction);
+  if (length <= 1e-6) return [anchor[0], anchor[1], anchor[2] + 1];
+  const depth = 1;
+  return [
+    Number((anchor[0] + (direction[0] / length) * depth).toFixed(6)),
+    Number((anchor[1] + (direction[1] / length) * depth).toFixed(6)),
+    Number((anchor[2] + (direction[2] / length) * depth).toFixed(6)),
+  ];
+}
+
+function frameIndexForAnchor(anchorIndex: number, pathPlanner: PathPlannerDraft) {
+  return Math.max(0, Math.round(anchorIndex * Math.max(1, pathPlanner.frameCount || 80)));
+}
+
+function selectedFrameForOptions(options: { selectedFrame?: number }, frameLength: number) {
+  if (frameLength <= 0) return 0;
+  if (typeof options.selectedFrame === "number" && Number.isFinite(options.selectedFrame)) {
+    return Math.max(0, Math.min(frameLength - 1, Math.round(options.selectedFrame)));
+  }
+  return Math.max(0, frameLength - 1);
 }
